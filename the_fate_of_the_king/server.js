@@ -89,11 +89,9 @@ CREATE TABLE IF NOT EXISTS events (
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
 
--- полезно для защиты от дублей при повторном /get-card
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_per_turn
 ON events(king_id, turn);
 
--- Knowledge store: facts + events + arc outcomes
 CREATE TABLE IF NOT EXISTS knowledge (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   king_id INTEGER NOT NULL,
@@ -107,7 +105,6 @@ CREATE TABLE IF NOT EXISTS knowledge (
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
 
--- FTS5 index (contentless)
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
   text,
   tags,
@@ -127,7 +124,6 @@ function ensureEventsColumns() {
   for (const c of need) if (!cols.includes(c.name)) db.exec(c.sql);
 }
 ensureEventsColumns();
-
 
 function safeJsonParse(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
@@ -213,6 +209,91 @@ function clampMetric(x) {
   return Math.max(0, Math.min(300, Math.round(n)));
 }
 
+function clampInt(n, a, b) {
+  const x = parseInt(n, 10);
+  if (!Number.isFinite(x)) return a;
+  return Math.max(a, Math.min(b, x));
+}
+
+function randInt(a, b) {
+  return Math.floor(Math.random() * (b - a + 1)) + a;
+}
+
+
+const ARC_LEN_MIN = 3;
+const ARC_LEN_MAX = 6;
+const ARC_GAP_MIN = 3;
+const ARC_GAP_MAX = 8;
+
+
+function ensureArcCadenceMemory(mem) {
+  const m = mem || {};
+  if (m.nextArcStartTurn === undefined || m.nextArcStartTurn === null) {
+    m.nextArcStartTurn = 3;
+  }
+  if (!Array.isArray(m.arcLengthHistory)) m.arcLengthHistory = [];
+  if (m.pendingNextArcGap === undefined) m.pendingNextArcGap = null;
+  return m;
+}
+
+function pickArcGap() {
+  return randInt(ARC_GAP_MIN, ARC_GAP_MAX);
+}
+
+function pickArcLengthFromHistory(lengthHistory) {
+  const weights = { 3: 4, 4: 4, 5: 3, 6: 2 };
+
+  const hist = Array.isArray(lengthHistory) ? lengthHistory.slice(-6) : [];
+  const count3 = hist.filter(x => x === 3).length;
+  const count6 = hist.filter(x => x === 6).length;
+
+  if (count3 >= 3) {
+    weights[6] += 4;
+    weights[5] += 2;
+  }
+
+  if (count6 >= 2) {
+    weights[3] += 3;
+    weights[4] += 2;
+  }
+
+  if (hist.length === 0) {
+    weights[4] += 2;
+  }
+
+  const items = Object.entries(weights).map(([k, w]) => [parseInt(k, 10), Math.max(0, w)]);
+  const sum = items.reduce((acc, [, w]) => acc + w, 0) || 1;
+  let r = Math.random() * sum;
+  for (const [len, w] of items) {
+    r -= w;
+    if (r <= 0) return len;
+  }
+  return 4;
+}
+
+function isArcStartEligible({ memory, currentTurn }) {
+  const m = ensureArcCadenceMemory(memory);
+  const t = Number(currentTurn || 0);
+  const next = Number(m.nextArcStartTurn || 0);
+  return t >= next;
+}
+
+function enforceArcSeedTurns(seed, length) {
+  const s = seed && typeof seed === "object" ? { ...seed } : {};
+  s.expectedTurns = clampInt(length, ARC_LEN_MIN, ARC_LEN_MAX);
+  return s;
+}
+
+function longArcStakesHint(stakes, kind) {
+  const base = String(stakes || "").trim();
+  const addon =
+    "Длинная арка (6 ходов): веди цепочку улик/подозреваемых или поиск тайника/клада. " +
+    "Каждый ход должен давать новый фрагмент истины (ключ, свидетель, карта, код, найденный предмет).";
+  if (!base) return addon;
+  if (base.length > 120) return base;
+  return `${base} ${addon}`.trim();
+}
+
 function getKingRow(kingId) {
   return db.prepare(`SELECT id, name, age, description FROM kings WHERE id=?`).get(kingId) || null;
 }
@@ -271,7 +352,6 @@ function getRecentEventSummaries(kingId, limit = 4) {
     LIMIT ?
   `).all(kingId, limit);
 
-
   const out = [];
   for (const r of rows) {
     const card = safeJsonParse(r.card_json, null);
@@ -300,7 +380,6 @@ function updateEventChoice({ kingId, turn, choiceIndex, effects, summary }) {
     WHERE king_id=? AND turn=?
   `).run(choiceIndex, JSON.stringify(effects), summary || "", kingId, turn);
 }
-
 
 function normalizeTags(tags) {
   const arr = Array.isArray(tags) ? tags : [];
@@ -345,7 +424,6 @@ function insertKnowledge({ kingId, kind, refTable = null, refId = null, turn, ta
 }
 
 function pruneFacts(kingId, maxFacts = 80) {
-
   const ids = db.prepare(`
     SELECT id FROM knowledge
     WHERE king_id=? AND kind='fact'
@@ -355,13 +433,11 @@ function pruneFacts(kingId, maxFacts = 80) {
 
   if (ids.length < maxFacts) return;
 
-
   const keepMinId = Math.min(...ids);
   db.prepare(`
     DELETE FROM knowledge
     WHERE king_id=? AND kind='fact' AND id < ?
   `).run(kingId, keepMinId);
-
 
   db.prepare(`
     DELETE FROM knowledge_fts
@@ -526,7 +602,6 @@ function selectAnchors(retrieved, { isFinale = false } = {}) {
   }
 
   if (isFinale) {
-
     take(byFresh, Math.min(3, want));
     take(byScore, want);
   } else {
@@ -555,7 +630,6 @@ function buildRetrievalQuery({ kingName, metrics, planner, worldRow, activeArc }
     if (activeArc.stakes) parts.push(activeArc.stakes);
     if (activeArc.phase) parts.push(activeArc.phase);
     if (activeArc.trigger_metric) parts.push(activeArc.trigger_metric);
-
 
     const st = Number(activeArc.stage || 0);
     if (st <= 1) parts.push("rumor", "pressure", "warning");
@@ -663,14 +737,12 @@ app.post("/start-game", async (req, res) => {
     db.prepare(`INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty) VALUES (?, 150, 150, 150, 150)`).run(kingId);
 
     const ws = createInitialWorldState(nk);
-    ws.memory = ws.memory || {};
+    ws.memory = ensureArcCadenceMemory(ws.memory || {});
     ws.memory.kingName = nk.name;
-
 
     ws.memory.finalePendingTurn = null;
     ws.memory.lastFinaleArcId = null;
     ws.memory.lastFinaleKey = null;
-
 
     if (ws.memory.pendingArcResolution === undefined) ws.memory.pendingArcResolution = null;
 
@@ -708,25 +780,28 @@ app.post("/get-card", async (req, res) => {
 
     let worldRow = getWorldRow(kingId);
     if (!worldRow) {
+      const memory = ensureArcCadenceMemory({
+        recentThemes: [],
+        lastEventSummary: "",
+        lastChoiceSummary: "",
+        lastArc: null,
+        pendingArcResolution: null,
+        finalePendingTurn: null,
+        lastFinaleArcId: null,
+        lastFinaleKey: null,
+        kingName
+      });
+
       saveWorldRow(kingId, {
         turn: 0,
-        memory: {
-          recentThemes: [],
-          lastEventSummary: "",
-          lastChoiceSummary: "",
-          lastArc: null,
-          pendingArcResolution: null,
-          finalePendingTurn: null,
-          lastFinaleArcId: null,
-          lastFinaleKey: null,
-          kingName
-        },
+        memory,
         constraints: { tone: "dark medieval", noModern: true }
       });
       worldRow = getWorldRow(kingId);
     } else {
-      worldRow.memory = worldRow.memory || {};
+      worldRow.memory = ensureArcCadenceMemory(worldRow.memory || {});
       if (!worldRow.memory.kingName && kingName) worldRow.memory.kingName = kingName;
+
       if (worldRow.memory.finalePendingTurn === undefined) worldRow.memory.finalePendingTurn = null;
       if (worldRow.memory.lastFinaleArcId === undefined) worldRow.memory.lastFinaleArcId = null;
       if (worldRow.memory.lastFinaleKey === undefined) worldRow.memory.lastFinaleKey = null;
@@ -762,10 +837,12 @@ app.post("/get-card", async (req, res) => {
       (!!pending && pendingArcId != null && pendingArcId !== lastFinaleArcId) ||
       (!!pendingKey && worldRow.memory.lastFinaleKey !== pendingKey);
 
+    const arcStartEligible = !activeArc && !isFinale && isArcStartEligible({ memory: worldRow.memory, currentTurn: nextTurn });
 
-    const recentSummaries = getRecentEventSummaries(kingId, 4);
-    const recentBlock = recentSummaries.length ? recentSummaries.join("\n") : "- (none)";
-
+    if (!activeArc && !isFinale) {
+      recentSummaries = getRecentEventSummaries(kingId, 4);
+      recentBlock = recentSummaries.length ? recentSummaries.join("\n") : "- (none)";
+    }
 
     let retrieved = [];
     if (isFinale) {
@@ -793,58 +870,81 @@ app.post("/get-card", async (req, res) => {
 
     const anchorItems = selectAnchors(retrieved, { isFinale });
     const anchors =
-      anchorItems
-        .map(r => `- (turn ${r.turn}) ${String(r.text || "").trim()}`)
-        .join("\n") || "- (none)";
+      anchorItems.map(r => `- (turn ${r.turn}) ${String(r.text || "").trim()}`).join("\n") || "- (none)";
 
+    let arcPacing = null;
+    if (activeArc?.status === "active") {
+      const totalTurns = Math.max(1, (activeArc.expires_turn - activeArc.created_turn));
+      const progressTurns = Math.max(0, nextTurn - activeArc.created_turn);
+      const remainingTurns = Math.max(0, activeArc.expires_turn - nextTurn);
+
+      arcPacing = {
+        totalTurns,
+        progressTurns,
+        remainingTurns,
+        isLongArc: totalTurns >= 6
+      };
+    }
 
     const directive = isFinale
       ? {
           mode: "arc_resolution",
           arc: pending,
-          note:
-            "EPILOGUE: Must explicitly close the arc. No new conflict. No new arc seed. Choices ceremonial (zero effects)."
+          note: "EPILOGUE: Must explicitly close the arc. No new conflict. No new arc seed. Choices ceremonial (zero effects)."
         }
       : {
           mode: "normal",
           theme: planner.theme,
           intent: planner.intent,
-          arcDirective: planner.arcDirective
+          arcDirective: planner.arcDirective,
+          arcStartEligible
         };
 
     const finaleChoiceA = "Принять итог и продолжить правление";
     const finaleChoiceB = "Закрепить исход и продолжить правление";
+
+    const antiRepeatSection = (!activeArc && !isFinale)
+      ? `Anti-repeat (DO NOT repeat these recent situations):\n${recentBlock}\n`
+      : "";
 
     const prompt = `
 Game: The Fate of the King (medieval, grounded, dark tone).
 Hard constraints:
 - NO modern tech, NO guns, NO electricity, NO internet, NO cars.
 - Keep names and places consistent with medieval vibe.
-- Avoid repeating the exact same scenario.
-- The event MUST fit the current situation and planner intent.
+- Return ONLY JSON. No markdown.
 
-Current metrics (0..300, higher is better):
+Metrics (0..300, higher is better):
 ${JSON.stringify(metrics, null, 2)}
 
 Directive:
 ${JSON.stringify(directive, null, 2)}
 
-Rules:
-- Create a materially different scenario than the anti-repeat list.
-- Use at least 2 anchor facts (names/places/consequences), but do NOT copy anchors verbatim.
+Active arc pacing (if any):
+${JSON.stringify(arcPacing, null, 2)}
 
-Background knowledge:
+${antiRepeatSection}
+
+Background knowledge (use at least 2, but do NOT copy verbatim):
 ${anchors}
 
 Task:
 Generate ONE event card with 2 choices.
-Each choice should feel meaningful and trade-off-ish.
-Effects must be integers in range [-20..20].
-Return ONLY JSON matching the schema.
+Each choice must be meaningful trade-off.
+Effects must be integers [-20..20].
 
-Arc seed rule (only for normal mode):
-- If there is NO active arc AND mode is normal, you MAY include "arc" object as a seed.
-- Never include status/phase/stage/tension inside card.arc.
+Mode guidance:
+- If there is an ACTIVE arc: advance the arc with new development (not repetition). Escalate or reveal new information.
+- If there is NO active arc:
+  - If arcStartEligible=false: generate a small standalone "side quest" / quick court matter (merchant, dispute, local issue). It must still reference world facts, but MUST NOT propose a new long arc.
+  - If arcStartEligible=true: you MAY propose a new arc seed by including "arc" object, but only if it naturally fits.
+
+Special rule for LONG arcs (totalTurns >= 6):
+- Include investigation / mystery / trail of clues or treasure hunt style progression: each arc step reveals a NEW clue, witness, map fragment, coded letter, or hidden stash.
+
+Arc seed rule:
+- If arcStartEligible is false, DO NOT include "arc" field.
+- If you include arc: expectedTurns should be between 3 and 6.
 
 Return ONLY JSON matching schema.
 `.trim();
@@ -868,11 +968,11 @@ Return ONLY JSON matching schema.
       console.timeEnd(label);
     }
     console.log(prompt);
+
     const content = data.choices?.[0]?.message?.content;
     if (!content) return res.status(500).json({ error: "Пустой ответ LLM" });
 
     let card = normalizeCard(parseStrictJson(content));
-
 
     if (isFinale) {
       const t = String(card.title || "").trim();
@@ -900,11 +1000,15 @@ Return ONLY JSON matching schema.
         ].filter(Boolean).join("\n");
         card.description = `${d}\n\n${patch}`.trim().slice(0, 800);
       }
+    } else {
+
+      if (!arcStartEligible && card.arc) {
+        delete card.arc;
+      }
     }
 
     const vv = validateCard(card);
     if (!vv.ok) return res.status(500).json({ error: "Карточка не прошла валидацию", details: vv.errors });
-
 
     try {
       card.image = await generateImage(`${card.title}. Medieval illustration, dark, dramatic, cinematic.`);
@@ -917,7 +1021,7 @@ Return ONLY JSON matching schema.
 
     if (isFinale) {
       const w2 = getWorldRow(kingId);
-      w2.memory = w2.memory || {};
+      w2.memory = ensureArcCadenceMemory(w2.memory || {});
       w2.memory.pendingArcResolution = null;
       w2.memory.finalePendingTurn = nextTurn;
 
@@ -930,9 +1034,16 @@ Return ONLY JSON matching schema.
     res.json({
       ...card,
       turn: nextTurn,
-      planner: { theme: planner.theme, intent: planner.intent, mode: directive.mode },
+      planner: {
+        theme: planner.theme,
+        intent: planner.intent,
+        mode: directive.mode,
+        arcStartEligible
+      },
       debug: {
         isFinale,
+        arcStartEligible,
+        nextArcStartTurn: worldRow.memory?.nextArcStartTurn ?? null,
         anchorsCount: anchorItems.length,
         recentCount: recentSummaries.length
       }
@@ -956,6 +1067,8 @@ app.post("/apply-choice", (req, res) => {
 
     let worldRow = getWorldRow(kingId);
     if (!worldRow) return res.status(500).json({ error: "world_state не найден" });
+
+    worldRow.memory = ensureArcCadenceMemory(worldRow.memory || {});
 
     const ci = Number.isInteger(choiceIndex) ? choiceIndex : null;
     if (!(card && (ci === 0 || ci === 1))) return res.status(400).json({ error: "Нужны card и choiceIndex 0/1" });
@@ -985,17 +1098,22 @@ app.post("/apply-choice", (req, res) => {
       updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId
     );
 
-
     const mergedWorld = applyChoiceToMemory(worldRow, card, ci, theme);
+    mergedWorld.memory = ensureArcCadenceMemory(mergedWorld.memory || {});
 
     if (isFinaleChoice) {
-      mergedWorld.memory = mergedWorld.memory || {};
       mergedWorld.memory.finalePendingTurn = null;
       mergedWorld.memory.pendingArcResolution = null;
+
+      const gap = Number.isInteger(mergedWorld.memory.pendingNextArcGap)
+        ? mergedWorld.memory.pendingNextArcGap
+        : pickArcGap();
+
+      mergedWorld.memory.pendingNextArcGap = null;
+      mergedWorld.memory.nextArcStartTurn = (mergedWorld.turn ?? 0) + gap;
     }
 
     saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
-
 
     updateEventChoice({
       kingId,
@@ -1006,7 +1124,6 @@ app.post("/apply-choice", (req, res) => {
     });
 
     const eventId = getEventIdByTurn(kingId, mergedWorld.turn);
-
 
     insertKnowledge({
       kingId,
@@ -1044,16 +1161,23 @@ app.post("/apply-choice", (req, res) => {
       );
 
       if (advanced.status !== "active") {
+
+        const arcLen = Math.max(ARC_LEN_MIN, Math.min(ARC_LEN_MAX, (advanced.ended_turn - advanced.created_turn + 1)));
+
         const w2 = getWorldRow(kingId);
-        w2.memory = w2.memory || {};
+        w2.memory = ensureArcCadenceMemory(w2.memory || {});
 
         w2.memory.lastArc = {
           title: advanced.title,
           kind: advanced.kind,
           status: advanced.status,
           endedTurn: advanced.ended_turn,
-          outcome: advanced.outcome_text
+          outcome: advanced.outcome_text,
+          length: arcLen
         };
+
+        w2.memory.arcLengthHistory = Array.isArray(w2.memory.arcLengthHistory) ? w2.memory.arcLengthHistory : [];
+        w2.memory.arcLengthHistory = [...w2.memory.arcLengthHistory, arcLen].slice(-10);
 
         w2.memory.pendingArcResolution = {
           arcId: activeArc.id,
@@ -1061,6 +1185,8 @@ app.post("/apply-choice", (req, res) => {
           kind: advanced.kind,
           outcome: advanced.outcome_text
         };
+
+        w2.memory.pendingNextArcGap = pickArcGap();
 
         saveWorldRow(kingId, { turn: w2.turn, memory: w2.memory, constraints: w2.constraints });
 
@@ -1077,12 +1203,23 @@ app.post("/apply-choice", (req, res) => {
     }
 
     activeArc = getActiveArc(kingId);
-    if (!activeArc && !isFinaleChoice) {
-      const wNow = getWorldRow(kingId);
-      const lastArc = wNow?.memory?.lastArc || null;
-      const cooldownOk = !lastArc?.endedTurn || (mergedWorld.turn - lastArc.endedTurn) >= 2;
+    const eligibleNow = !activeArc && !isFinaleChoice && isArcStartEligible({ memory: mergedWorld.memory, currentTurn: mergedWorld.turn });
 
-      const seed = normalizeArcSeed(card.arc) || defaultArcSeed(updated);
+    if (!activeArc && !isFinaleChoice && eligibleNow) {
+      const wNow = getWorldRow(kingId);
+      wNow.memory = ensureArcCadenceMemory(wNow.memory || {});
+      const lastArc = wNow?.memory?.lastArc || null;
+
+      const rawSeed = normalizeArcSeed(card.arc) || defaultArcSeed(updated);
+
+      const pickedLen = pickArcLengthFromHistory(wNow.memory.arcLengthHistory);
+
+      const seed = enforceArcSeedTurns(rawSeed, pickedLen);
+
+      if (pickedLen >= 6) {
+        seed.stakes = longArcStakesHint(seed.stakes, seed.kind);
+      }
+
       const newArc = createActiveArcFromSeed(seed, mergedWorld.turn);
 
       const sameKey =
@@ -1090,7 +1227,7 @@ app.post("/apply-choice", (req, res) => {
         String(lastArc.title || "").trim().toLowerCase() === String(newArc.title || "").trim().toLowerCase() &&
         String(lastArc.kind || "").trim().toLowerCase() === String(newArc.kind || "").trim().toLowerCase();
 
-      if (cooldownOk && !sameKey) {
+      if (!sameKey) {
         const info = db.prepare(`
           INSERT INTO arcs (
             king_id, title, kind, trigger_metric, stakes,
@@ -1111,15 +1248,26 @@ app.post("/apply-choice", (req, res) => {
           newArc.expires_turn
         );
 
+        mergedWorld.memory.nextArcStartTurn = (mergedWorld.turn ?? 0) + 9999;
+
+        const startTags = ["arc", newArc.kind, "start", `len_${pickedLen}`];
+        if (pickedLen >= 6) startTags.push("mystery", "investigation", "treasure");
+
         insertKnowledge({
           kingId,
           kind: "fact",
           refTable: "arcs",
           refId: info.lastInsertRowid,
           turn: mergedWorld.turn,
-          tags: ["arc", newArc.kind, "start"],
-          text: `Началась арка "${newArc.title}" (${newArc.kind}). Ставки: ${newArc.stakes}`
+          tags: startTags,
+          text: `Началась арка "${newArc.title}" (${newArc.kind}, ${pickedLen} ходов). Ставки: ${newArc.stakes}`
         });
+
+        saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
+      } else {
+        // если совпало — сдвинем окно старта немного, чтобы не зациклиться
+        mergedWorld.memory.nextArcStartTurn = (mergedWorld.turn ?? 0) + randInt(2, 4);
+        saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
       }
     }
 
@@ -1134,4 +1282,4 @@ app.post("/apply-choice", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
