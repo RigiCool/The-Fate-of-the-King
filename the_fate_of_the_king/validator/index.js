@@ -50,7 +50,6 @@ function makeValidator(schema) {
   };
 }
 
-
 function normalizeArcSeedLike(arc) {
   if (!arc || typeof arc !== "object") return undefined;
 
@@ -58,14 +57,10 @@ function normalizeArcSeedLike(arc) {
   const kind = String(arc.kind ?? "").trim();
   const triggerMetric = String(arc.triggerMetric ?? "").trim();
 
-
-  const expectedTurnsRaw = arc.expectedTurns;
-  const expectedTurns = clamp(parseInt(expectedTurnsRaw, 10) || 4, 2, 8);
+  const expectedTurns = clamp(parseInt(arc.expectedTurns, 10) || 4, 2, 8);
 
   const stakes = arc.stakes != null ? String(arc.stakes).trim() : "";
-
   if (!title) return undefined;
-
 
   return {
     title: title.length > 80 ? title.slice(0, 77) + "..." : title,
@@ -86,7 +81,10 @@ function normalizeCard(card) {
   };
 
   while (out.choices.length < 2) {
-    out.choices.push({ text: "…", effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 } });
+    out.choices.push({
+      text: "…",
+      effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 }
+    });
   }
 
   out.choices = out.choices.map((c) => {
@@ -110,10 +108,7 @@ function normalizeCard(card) {
     text: c.text.length > 180 ? c.text.slice(0, 177) + "..." : c.text
   }));
 
-
   const arcNorm = normalizeArcSeedLike(card.arc);
-
-
   if (arcNorm) out.arc = arcNorm;
 
   return out;

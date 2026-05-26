@@ -8,13 +8,31 @@ const { CARD_SCHEMA } = require("./schema/card_schema.js");
 const { KING_SCHEMA } = require("./schema/king_schema.js");
 
 const { makeValidator, parseStrictJson, normalizeCard } = require("./validator/index.js");
-const { buildPlannerPacket } = require("./planner/index.js");
+
+const {
+  buildPlannerPacket,
+  retrieveKnowledgeFTS,
+  mergeRetrieved,
+  selectAnchors,
+  buildRetrievalQuery
+} = require("./planner/index.js");
+
 const { createInitialWorldState, applyChoiceToMemory } = require("./world/world_state.js");
+
 const {
   normalizeArcSeed,
   defaultArcSeed,
   createActiveArcFromSeed,
-  advanceArcRow
+  advanceArcRow,
+
+  ARC_LEN_MIN,
+  ARC_LEN_MAX,
+  ensureArcCadenceMemory,
+  pickArcGap,
+  pickArcLengthFromHistory,
+  isArcStartEligible,
+  enforceArcSeedTurns,
+  longArcStakesHint
 } = require("./world/arc_manager.js");
 
 const app = express();
@@ -209,91 +227,6 @@ function clampMetric(x) {
   return Math.max(0, Math.min(300, Math.round(n)));
 }
 
-function clampInt(n, a, b) {
-  const x = parseInt(n, 10);
-  if (!Number.isFinite(x)) return a;
-  return Math.max(a, Math.min(b, x));
-}
-
-function randInt(a, b) {
-  return Math.floor(Math.random() * (b - a + 1)) + a;
-}
-
-
-const ARC_LEN_MIN = 3;
-const ARC_LEN_MAX = 6;
-const ARC_GAP_MIN = 3;
-const ARC_GAP_MAX = 8;
-
-
-function ensureArcCadenceMemory(mem) {
-  const m = mem || {};
-  if (m.nextArcStartTurn === undefined || m.nextArcStartTurn === null) {
-    m.nextArcStartTurn = 3;
-  }
-  if (!Array.isArray(m.arcLengthHistory)) m.arcLengthHistory = [];
-  if (m.pendingNextArcGap === undefined) m.pendingNextArcGap = null;
-  return m;
-}
-
-function pickArcGap() {
-  return randInt(ARC_GAP_MIN, ARC_GAP_MAX);
-}
-
-function pickArcLengthFromHistory(lengthHistory) {
-  const weights = { 3: 4, 4: 4, 5: 3, 6: 2 };
-
-  const hist = Array.isArray(lengthHistory) ? lengthHistory.slice(-6) : [];
-  const count3 = hist.filter(x => x === 3).length;
-  const count6 = hist.filter(x => x === 6).length;
-
-  if (count3 >= 3) {
-    weights[6] += 4;
-    weights[5] += 2;
-  }
-
-  if (count6 >= 2) {
-    weights[3] += 3;
-    weights[4] += 2;
-  }
-
-  if (hist.length === 0) {
-    weights[4] += 2;
-  }
-
-  const items = Object.entries(weights).map(([k, w]) => [parseInt(k, 10), Math.max(0, w)]);
-  const sum = items.reduce((acc, [, w]) => acc + w, 0) || 1;
-  let r = Math.random() * sum;
-  for (const [len, w] of items) {
-    r -= w;
-    if (r <= 0) return len;
-  }
-  return 4;
-}
-
-function isArcStartEligible({ memory, currentTurn }) {
-  const m = ensureArcCadenceMemory(memory);
-  const t = Number(currentTurn || 0);
-  const next = Number(m.nextArcStartTurn || 0);
-  return t >= next;
-}
-
-function enforceArcSeedTurns(seed, length) {
-  const s = seed && typeof seed === "object" ? { ...seed } : {};
-  s.expectedTurns = clampInt(length, ARC_LEN_MIN, ARC_LEN_MAX);
-  return s;
-}
-
-function longArcStakesHint(stakes, kind) {
-  const base = String(stakes || "").trim();
-  const addon =
-    "Длинная арка (6 ходов): веди цепочку улик/подозреваемых или поиск тайника/клада. " +
-    "Каждый ход должен давать новый фрагмент истины (ключ, свидетель, карта, код, найденный предмет).";
-  if (!base) return addon;
-  if (base.length > 120) return base;
-  return `${base} ${addon}`.trim();
-}
-
 function getKingRow(kingId) {
   return db.prepare(`SELECT id, name, age, description FROM kings WHERE id=?`).get(kingId) || null;
 }
@@ -345,7 +278,7 @@ function getEventCardByTurn(kingId, turn) {
 
 function getRecentEventSummaries(kingId, limit = 4) {
   const rows = db.prepare(`
-    SELECT turn, card_json, summary
+    SELECT turn, card_json
     FROM events
     WHERE king_id=? AND chosen_index IS NOT NULL
     ORDER BY turn DESC
@@ -508,167 +441,6 @@ function insertImpactFacts({ kingId, turn, theme, effects }) {
   }
 }
 
-function retrieveKnowledgeFTS({ kingId, query, topK = 10 }) {
-  const q = String(query || "").trim();
-  if (!q) return [];
-  try {
-    const rows = db.prepare(`
-      SELECT
-        k.id AS rowid,
-        k.text AS text,
-        f.tags AS tags,
-        k.turn AS turn,
-        bm25(knowledge_fts, 1.0, 0.3) AS score
-      FROM knowledge_fts f
-      JOIN knowledge k ON k.id = f.rowid
-      WHERE knowledge_fts MATCH ?
-        AND k.king_id = ?
-      ORDER BY score ASC
-      LIMIT ?
-    `).all(q, kingId, topK);
-
-    return rows.map(r => ({
-      rowid: r.rowid,
-      text: r.text,
-      tags: String(r.tags || "").split(" ").filter(Boolean),
-      turn: r.turn,
-      score: r.score
-    }));
-  } catch (e) {
-    try {
-      const fallback = q.split(/\s+OR\s+/).slice(0, 6).join(" ");
-      const rows2 = db.prepare(`
-        SELECT
-          k.id AS rowid,
-          k.text AS text,
-          f.tags AS tags,
-          k.turn AS turn,
-          bm25(knowledge_fts, 1.0, 0.3) AS score
-        FROM knowledge_fts f
-        JOIN knowledge k ON k.id = f.rowid
-        WHERE knowledge_fts MATCH ?
-          AND k.king_id = ?
-        ORDER BY score ASC
-        LIMIT ?
-      `).all(fallback, kingId, topK);
-
-      return rows2.map(r => ({
-        rowid: r.rowid,
-        text: r.text,
-        tags: String(r.tags || "").split(" ").filter(Boolean),
-        turn: r.turn,
-        score: r.score
-      }));
-    } catch {
-      return [];
-    }
-  }
-}
-
-function mergeRetrieved(core, situational, limit = 12) {
-  const out = [];
-  const seen = new Set();
-  for (const x of [...(core || []), ...(situational || [])]) {
-    const rid = x.rowid ?? "";
-    const key = `${rid}|${String(x.text || "").slice(0, 160)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(x);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-function selectAnchors(retrieved, { isFinale = false } = {}) {
-  const list = Array.isArray(retrieved) ? retrieved.slice() : [];
-  if (list.length === 0) return [];
-
-  const byFresh = [...list].sort((a, b) => (b.turn ?? 0) - (a.turn ?? 0));
-  const byScore = [...list].sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
-
-  const picks = [];
-  const seen = new Set();
-
-  const want = isFinale ? 6 : 4;
-
-  function take(arr, n) {
-    for (const r of arr) {
-      const key = `${r.rowid}|${String(r.text || "").slice(0, 80)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      picks.push(r);
-      if (picks.length >= n) break;
-    }
-  }
-
-  if (isFinale) {
-    take(byFresh, Math.min(3, want));
-    take(byScore, want);
-  } else {
-    take(byFresh, 2);
-    take(byScore, want);
-  }
-
-  return picks.slice(0, want);
-}
-
-function buildRetrievalQuery({ kingName, metrics, planner, worldRow, activeArc }) {
-  const parts = [];
-
-  if (planner?.intent) parts.push(planner.intent);
-  if (planner?.theme) parts.push(planner.theme);
-
-  const mem = worldRow?.memory || {};
-  if (mem.lastEventSummary) parts.push(mem.lastEventSummary);
-  if (mem.lastChoiceSummary) parts.push(mem.lastChoiceSummary);
-
-  if (kingName) parts.push(kingName);
-
-  if (activeArc?.status === "active") {
-    parts.push(activeArc.kind);
-    parts.push(activeArc.title);
-    if (activeArc.stakes) parts.push(activeArc.stakes);
-    if (activeArc.phase) parts.push(activeArc.phase);
-    if (activeArc.trigger_metric) parts.push(activeArc.trigger_metric);
-
-    const st = Number(activeArc.stage || 0);
-    if (st <= 1) parts.push("rumor", "pressure", "warning");
-    else if (st === 2) parts.push("ultimatum", "deadline", "uprising", "siege");
-    else parts.push("confrontation", "trial", "battle", "reckoning");
-  }
-
-  if (metrics.economy < 120) parts.push("tax", "grain", "debt", "market", "trade");
-  if (metrics.loyalty < 120) parts.push("nobles", "riot", "uprising", "oath");
-  if (metrics.army < 120) parts.push("garrison", "deserters", "fort", "border");
-  if (metrics.diplomacy < 120) parts.push("envoy", "treaty", "hostage", "alliance");
-
-  const tagHints = [];
-  if (planner?.theme) {
-    const th = String(planner.theme).toLowerCase().replace(/[^\w-]+/g, "");
-    if (th) tagHints.push(`tags:${th}`);
-  }
-  if (activeArc?.kind) {
-    const ak = String(activeArc.kind).toLowerCase().replace(/[^\w-]+/g, "");
-    if (ak) tagHints.push(`tags:${ak}`);
-  }
-  tagHints.push("tags:event", "tags:arc", "tags:fact", "tags:decision");
-
-  const uniq = [];
-  const seen = new Set();
-  for (const p of parts.join(" ").split(/\s+/).filter(Boolean)) {
-    const w = p.replace(/[^\p{L}\p{N}_-]+/gu, "").toLowerCase();
-    if (!w || w.length < 3) continue;
-    if (seen.has(w)) continue;
-    seen.add(w);
-    uniq.push(w);
-    if (uniq.length >= 16) break;
-  }
-
-  const base = uniq.join(" OR ");
-  const tagsPart = tagHints.filter(Boolean).join(" OR ");
-  return [tagsPart, base].filter(Boolean).join(" OR ");
-}
-
 app.post("/debug/rebuild-fts", (req, res) => {
   try {
     db.exec(`DELETE FROM knowledge_fts;`);
@@ -696,13 +468,6 @@ app.post("/debug/rebuild-fts", (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e).slice(0, 1000) });
   }
-});
-
-app.get("/debug/world/:kingId", (req, res) => {
-  const kingId = Number(req.params.kingId);
-  if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
-  const w = getWorldRow(kingId);
-  res.json({ kingId, world: w || null });
 });
 
 app.post("/start-game", async (req, res) => {
@@ -743,7 +508,6 @@ app.post("/start-game", async (req, res) => {
     ws.memory.finalePendingTurn = null;
     ws.memory.lastFinaleArcId = null;
     ws.memory.lastFinaleKey = null;
-
     if (ws.memory.pendingArcResolution === undefined) ws.memory.pendingArcResolution = null;
 
     saveWorldRow(kingId, { turn: ws.turn, memory: ws.memory, constraints: ws.constraints });
@@ -839,6 +603,8 @@ app.post("/get-card", async (req, res) => {
 
     const arcStartEligible = !activeArc && !isFinale && isArcStartEligible({ memory: worldRow.memory, currentTurn: nextTurn });
 
+    let recentSummaries = [];
+    let recentBlock = "- (none)";
     if (!activeArc && !isFinale) {
       recentSummaries = getRecentEventSummaries(kingId, 4);
       recentBlock = recentSummaries.length ? recentSummaries.join("\n") : "- (none)";
@@ -856,15 +622,15 @@ app.post("/get-card", async (req, res) => {
         titlePart ? titlePart : ""
       ].filter(Boolean).join(" OR ");
 
-      const core = retrieveKnowledgeFTS({ kingId, query: coreQuery, topK: 3 });
-      const situational = retrieveKnowledgeFTS({ kingId, query: situationalQuery, topK: 16 });
+      const core = retrieveKnowledgeFTS(db, { kingId, query: coreQuery, topK: 3 });
+      const situational = retrieveKnowledgeFTS(db, { kingId, query: situationalQuery, topK: 16 });
       retrieved = mergeRetrieved(core, situational, 16);
     } else {
       const coreQuery = `tags:king OR tags:origin OR tags:arc OR tags:fact OR tags:decision`;
       const situationalQuery = buildRetrievalQuery({ kingName, metrics, planner, worldRow, activeArc });
 
-      const core = retrieveKnowledgeFTS({ kingId, query: coreQuery, topK: 6 });
-      const situational = retrieveKnowledgeFTS({ kingId, query: situationalQuery, topK: 14 });
+      const core = retrieveKnowledgeFTS(db, { kingId, query: coreQuery, topK: 6 });
+      const situational = retrieveKnowledgeFTS(db, { kingId, query: situationalQuery, topK: 14 });
       retrieved = mergeRetrieved(core, situational, 16);
     }
 
@@ -968,7 +734,6 @@ Return ONLY JSON matching schema.
       console.timeEnd(label);
     }
     console.log(prompt);
-
     const content = data.choices?.[0]?.message?.content;
     if (!content) return res.status(500).json({ error: "Пустой ответ LLM" });
 
@@ -1001,7 +766,6 @@ Return ONLY JSON matching schema.
         card.description = `${d}\n\n${patch}`.trim().slice(0, 800);
       }
     } else {
-
       if (!arcStartEligible && card.arc) {
         delete card.arc;
       }
@@ -1161,7 +925,6 @@ app.post("/apply-choice", (req, res) => {
       );
 
       if (advanced.status !== "active") {
-
         const arcLen = Math.max(ARC_LEN_MIN, Math.min(ARC_LEN_MAX, (advanced.ended_turn - advanced.created_turn + 1)));
 
         const w2 = getWorldRow(kingId);
@@ -1176,8 +939,7 @@ app.post("/apply-choice", (req, res) => {
           length: arcLen
         };
 
-        w2.memory.arcLengthHistory = Array.isArray(w2.memory.arcLengthHistory) ? w2.memory.arcLengthHistory : [];
-        w2.memory.arcLengthHistory = [...w2.memory.arcLengthHistory, arcLen].slice(-10);
+        w2.memory.arcLengthHistory = [...(w2.memory.arcLengthHistory || []), arcLen].slice(-10);
 
         w2.memory.pendingArcResolution = {
           arcId: activeArc.id,
@@ -1203,7 +965,8 @@ app.post("/apply-choice", (req, res) => {
     }
 
     activeArc = getActiveArc(kingId);
-    const eligibleNow = !activeArc && !isFinaleChoice && isArcStartEligible({ memory: mergedWorld.memory, currentTurn: mergedWorld.turn });
+    const eligibleNow = !activeArc && !isFinaleChoice &&
+      isArcStartEligible({ memory: mergedWorld.memory, currentTurn: mergedWorld.turn });
 
     if (!activeArc && !isFinaleChoice && eligibleNow) {
       const wNow = getWorldRow(kingId);
@@ -1213,12 +976,9 @@ app.post("/apply-choice", (req, res) => {
       const rawSeed = normalizeArcSeed(card.arc) || defaultArcSeed(updated);
 
       const pickedLen = pickArcLengthFromHistory(wNow.memory.arcLengthHistory);
-
       const seed = enforceArcSeedTurns(rawSeed, pickedLen);
 
-      if (pickedLen >= 6) {
-        seed.stakes = longArcStakesHint(seed.stakes, seed.kind);
-      }
+      if (pickedLen >= 6) seed.stakes = longArcStakesHint(seed.stakes);
 
       const newArc = createActiveArcFromSeed(seed, mergedWorld.turn);
 
@@ -1265,8 +1025,7 @@ app.post("/apply-choice", (req, res) => {
 
         saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
       } else {
-        // если совпало — сдвинем окно старта немного, чтобы не зациклиться
-        mergedWorld.memory.nextArcStartTurn = (mergedWorld.turn ?? 0) + randInt(2, 4);
+        mergedWorld.memory.nextArcStartTurn = (mergedWorld.turn ?? 0) + 3;
         saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
       }
     }

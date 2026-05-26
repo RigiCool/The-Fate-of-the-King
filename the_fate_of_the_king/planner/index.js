@@ -82,4 +82,7 @@ function buildPlannerPacket(metrics, worldRow, activeArcRow) {
   };
 }
 
-module.exports = { buildPlannerPacket };
+module.exports = {
+  buildPlannerPacket,
+  ...require("./retrieval.js")
+};
