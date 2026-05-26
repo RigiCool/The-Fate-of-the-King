@@ -1,10 +1,12 @@
 import React, { useState } from "react";
 
-export default function Card({ title, description, choices, onChoice, image }) {
+export default function Card({ title, description, choices, onChoice, image, locked = false }) {
   const [offsetX, setOffsetX] = useState(0);
   const [hoveredIndex, setHoveredIndex] = useState(null);
 
   const handleMouseMove = (e) => {
+    if (locked) return;
+
     const { currentTarget, clientX } = e;
     const rect = currentTarget.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
@@ -18,25 +20,31 @@ export default function Card({ title, description, choices, onChoice, image }) {
   };
 
   const handleMouseLeave = () => {
+    if (locked) return;
     setOffsetX(0);
     setHoveredIndex(null);
   };
 
   const handleClick = () => {
     if (hoveredIndex === 0 || hoveredIndex === 1) {
-      onChoice(choices[hoveredIndex], hoveredIndex);
+      setOffsetX(0);
+      setHoveredIndex(null);
+
+      setTimeout(() => {
+        onChoice(choices[hoveredIndex], hoveredIndex);
+      }, 300);
     }
   };
 
   const hoveredChoice = hoveredIndex === null ? null : choices[hoveredIndex];
 
   return (
-    <div className="card-container" onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave} onClick={handleClick}>
+    <div className="card-container" onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave} onClick={handleClick} style={{ pointerEvents: locked ? "none" : "auto" }}>
       <div
         className="card"
         style={{
           transform: `translateX(${offsetX}px) rotate(${offsetX / 30}deg)`,
-          transition: hoveredChoice ? "none" : "transform 0.3s ease"
+          transition: hoveredIndex !== null ? "none" : "transform 0.3s ease"
         }}
       >
         {image ? (

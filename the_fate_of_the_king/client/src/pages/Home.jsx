@@ -33,6 +33,8 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [gameOver, setGameOver] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
 
   useEffect(() => {
     if (!kingId) return;
@@ -93,8 +95,19 @@ export default function Home() {
       if (!res.ok) throw new Error(await readErrorMessage(res));
       const data = await res.json();
       setCard(data);
+
+      setUnlocking(true);
+      setTimeout(() => {
+        setLocked(false);
+        setUnlocking(false);
+      }, 500);
     } catch (err) {
       setError(err?.message || String(err));
+      setUnlocking(true);
+      setTimeout(() => {
+        setLocked(false);
+        setUnlocking(false);
+      }, 500);
     } finally {
       setLoading(false);
     }
@@ -103,6 +116,7 @@ export default function Home() {
   const handleChoice = async (choice, choiceIndex) => {
     if (!king?.id || !card) return;
 
+    setLocked(true);
     setError(null);
 
     try {
@@ -168,7 +182,7 @@ export default function Home() {
 
       {!king && (
         <button className="btn" onClick={startGame} disabled={loading} style={{ marginTop: 12 }}>
-          {loading ? "Генерация..." : "Начать игру"}
+          {loading ? "Generating..." : "Start New Game"}
         </button>
       )}
 
@@ -190,19 +204,30 @@ export default function Home() {
             <>
               <p>{king.description}</p>
               <button className="btn" onClick={getCard} disabled={loading}>
-                {loading ? "Генерация события..." : "Начать испытания"}
+                {loading ? "Generating event..." : "Start Challenges"}
               </button>
             </>
           )}
         </div>
       )}
 
-      {card && (
+      {(locked || unlocking) && (
+        <div className="cinematic-overlay" style={{ animation: unlocking ? "fadeOut 0.5s ease-in forwards" : "fadeIn 0.5s ease-out, cinematicGradient 8s ease-in-out infinite" }}>
+          {!unlocking && (
+            <div className="loading-sigil">
+              <div className="sigil-icon" />
+              <div className="loading-text">Generating Event…</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {card && !locked && !unlocking && (
         <>
           {card?.planner?.mode === "arc_resolution" && (
             <p style={{ opacity: 0.8 }}>📜 Arc resolution</p>
           )}
-          <Card {...card} onChoice={gameOver ? redirect : handleChoice}/>
+          <Card key={`${card.title}-${card.turn || 'start'}`} {...card} locked={locked} onChoice={gameOver ? redirect : handleChoice} />
         </>
       )}
     </div>

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { api } from "../api/client";
+import { api } from "../api/Client";
 
 const AuthCtx = createContext(null);
 
@@ -22,7 +22,7 @@ export function AuthProvider({ children }) {
     }
   }
 
-  useEffect(() => { loadMe(); /* eslint-disable-next-line */ }, [token]);
+  useEffect(() => { loadMe(); }, [token]);
 
   async function login(email, password) {
     const r = await api.login(email, password);

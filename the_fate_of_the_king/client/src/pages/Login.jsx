@@ -26,13 +26,13 @@ export default function Login() {
       <form onSubmit={onSubmit}>
         <div>
           <label>Email</label>
-          <input value={email} onChange={(e)=>setEmail(e.target.value)} style={{ width:"100%" }} />
+          <input value={email} onChange={(e) => setEmail(e.target.value)} style={{ width: "100%" }} />
         </div>
         <div style={{ marginTop: 10 }}>
           <label>Password</label>
-          <input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} style={{ width:"100%" }} />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ width: "100%" }} />
         </div>
-        {err && <div style={{ color:"crimson", marginTop: 10 }}>{err}</div>}
+        {err && <div style={{ color: "crimson", marginTop: 10 }}>{err}</div>}
         <button style={{ marginTop: 14 }}>Login</button>
       </form>
       <div style={{ marginTop: 12 }}>

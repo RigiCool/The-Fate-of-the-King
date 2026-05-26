@@ -71,7 +71,7 @@ export default function Kings() {
           {user?.role === "admin" && (
             <Link className="nav-link" to="/admin/metrics" style={{ opacity: 0.9, marginLeft: 10 }}> Metrics </Link>
           )}
-          
+
           <div className="profile-link">{user?.email ? user.email : "Logged in"}</div>
           <button className="btn" onClick={logout}>Logout</button>
         </div>
