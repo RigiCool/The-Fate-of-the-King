@@ -1,15 +1,16 @@
-exports.KING_SCHEMA = {
+const KING_SCHEMA = {
   name: "king",
+  strict: true,
   schema: {
     type: "object",
-    properties: {
-      name: { type: "string" },
-      age: { type: "integer" },
-      description: { type: "string" }
-    },
+    additionalProperties: false,
     required: ["name", "age", "description"],
-    additionalProperties: false
+    properties: {
+      name: { type: "string", minLength: 1, maxLength: 60 },
+      age: { type: "integer", minimum: 14, maximum: 90 },
+      description: { type: "string", minLength: 1, maxLength: 800 }
+    }
   }
 };
 
-schema/king_schema.js
+module.exports = { KING_SCHEMA };

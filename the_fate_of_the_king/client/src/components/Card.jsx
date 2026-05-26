@@ -2,7 +2,7 @@ import React, { useState } from "react";
 
 export default function Card({ title, description, choices, onChoice, image }) {
   const [offsetX, setOffsetX] = useState(0);
-  const [hoveredChoice, setHoveredChoice] = useState(null);
+  const [hoveredIndex, setHoveredIndex] = useState(null);
 
   const handleMouseMove = (e) => {
     const { currentTarget, clientX } = e;
@@ -13,37 +13,34 @@ export default function Card({ title, description, choices, onChoice, image }) {
     setOffsetX(diff / 4);
 
     if (diff > 300) {
-      setHoveredChoice(choices[0]);
+      setHoveredIndex(0);
     } else if (diff < -300) {
-      setHoveredChoice(choices[1]);
+      setHoveredIndex(1);
     } else {
-      setHoveredChoice(null);
+      setHoveredIndex(null);
     }
   };
 
   const handleMouseLeave = () => {
     setOffsetX(0);
-    setHoveredChoice(null);
+    setHoveredIndex(null);
   };
 
   const handleClick = () => {
-    if (hoveredChoice) {
-      onChoice(hoveredChoice);
+    if (hoveredIndex === 0 || hoveredIndex === 1) {
+      onChoice(choices[hoveredIndex], hoveredIndex);
     }
   };
 
+  const hoveredChoice = hoveredIndex === null ? null : choices[hoveredIndex];
+
   return (
-    <div
-      className="card-container"
-      onMouseMove={handleMouseMove}
-      onMouseLeave={handleMouseLeave}
-      onClick={handleClick}
-    >
+    <div className="card-container" onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave} onClick={handleClick}>
       <div
         className="card"
         style={{
           transform: `translateX(${offsetX}px) rotate(${offsetX / 30}deg)`,
-          transition: hoveredChoice ? "none" : "transform 0.3s ease",
+          transition: hoveredChoice ? "none" : "transform 0.3s ease"
         }}
       >
         {image && (
@@ -54,7 +51,7 @@ export default function Card({ title, description, choices, onChoice, image }) {
               maxWidth: "250px",
               maxHeight: "250px",
               borderRadius: "8px",
-              marginBottom: "1rem",
+              marginBottom: "1rem"
             }}
           />
         )}
@@ -63,10 +60,10 @@ export default function Card({ title, description, choices, onChoice, image }) {
       </div>
 
       {hoveredChoice && (
-        <div
-          className={`overlay ${hoveredChoice === choices[0] ? "right" : "left"}`}
-        >
-          <span className={`card-choice ${hoveredChoice === choices[0] ? "right" : "left"}`}>{hoveredChoice.text}</span>
+        <div className={`overlay ${hoveredIndex === 0 ? "right" : "left"}`}>
+          <span className={`card-choice ${hoveredIndex === 0 ? "right" : "left"}`}>
+            {hoveredChoice.text}
+          </span>
         </div>
       )}
     </div>

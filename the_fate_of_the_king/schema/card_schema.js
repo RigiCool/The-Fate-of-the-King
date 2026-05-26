@@ -6,8 +6,8 @@ const CARD_SCHEMA = {
     additionalProperties: false,
     required: ["title", "description", "choices"],
     properties: {
-      title: { type: "string", description: "Короткий заголовок ситуации" },
-      description: { type: "string", description: "Описание ситуации перед королём" },
+      title: { type: "string", minLength: 1, maxLength: 120, description: "Короткий заголовок ситуации" },
+      description: { type: "string", minLength: 1, maxLength: 800, description: "Описание ситуации перед королём" },
       choices: {
         type: "array",
         minItems: 2,
@@ -17,7 +17,7 @@ const CARD_SCHEMA = {
           additionalProperties: false,
           required: ["text", "effects"],
           properties: {
-            text: { type: "string" },
+            text: { type: "string", minLength: 1, maxLength: 180 },
             effects: {
               type: "object",
               additionalProperties: false,
@@ -37,5 +37,3 @@ const CARD_SCHEMA = {
 };
 
 module.exports = { CARD_SCHEMA };
-
-schema/card_schema.js
