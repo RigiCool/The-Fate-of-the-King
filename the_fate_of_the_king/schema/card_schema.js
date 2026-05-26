@@ -1,3 +1,6 @@
+
+const { ARC_SEED_SCHEMA } = require("./arc_seed_schema.js");
+
 const CARD_SCHEMA = {
   name: "card",
   strict: true,
@@ -6,8 +9,20 @@ const CARD_SCHEMA = {
     additionalProperties: false,
     required: ["title", "description", "choices"],
     properties: {
-      title: { type: "string", minLength: 1, maxLength: 120, description: "Короткий заголовок ситуации" },
-      description: { type: "string", minLength: 1, maxLength: 800, description: "Описание ситуации перед королём" },
+      title: {
+        type: "string",
+        minLength: 1,
+        maxLength: 120,
+        description: "Короткий заголовок ситуации"
+      },
+
+      description: {
+        type: "string",
+        minLength: 1,
+        maxLength: 800,
+        description: "Описание ситуации перед королём"
+      },
+
       choices: {
         type: "array",
         minItems: 2,
@@ -31,7 +46,8 @@ const CARD_SCHEMA = {
             }
           }
         }
-      }
+      },
+      arc: ARC_SEED_SCHEMA
     }
   }
 };

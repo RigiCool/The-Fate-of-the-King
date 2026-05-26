@@ -1,9 +1,10 @@
+planner/index.js
+
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
 
 function weightedRandom(items) {
-
   const sum = items.reduce((acc, [, w]) => acc + Math.max(0, w), 0);
   if (sum <= 0) return items[0]?.[0] ?? "court";
   let r = Math.random() * sum;
@@ -14,23 +15,21 @@ function weightedRandom(items) {
   return items[items.length - 1]?.[0] ?? "court";
 }
 
-function pickTheme(metrics, world) {
+function pickTheme(metrics, worldMemory, activeArc) {
   const w = [];
 
+  if (activeArc && activeArc.status === "active") {
+    w.push(["arc_progress", 7]);
+  }
 
   if (metrics.army < 120) w.push(["military", 5]);
   if (metrics.economy < 120) w.push(["economy", 5]);
   if (metrics.loyalty < 120) w.push(["loyalty", 5]);
   if (metrics.diplomacy < 120) w.push(["diplomacy", 5]);
 
-
   w.push(["court", 2], ["intrigue", 2], ["external", 2], ["church", 1], ["peasantry", 1]);
 
-  const activeArc = (world?.arcs || []).find(a => a.status === "active");
-  if (activeArc) w.push(["arc_progress", 6]);
-
-  const recentThemes = world?.memory?.recentThemes || [];
-  const last = recentThemes[0];
+  const last = worldMemory?.recentThemes?.[0];
   if (last) {
     for (let i = 0; i < w.length; i++) {
       if (w[i][0] === last) w[i][1] = clamp(w[i][1] - 1, 0, 999);
@@ -40,8 +39,10 @@ function pickTheme(metrics, world) {
   return weightedRandom(w);
 }
 
-function intentFromTheme(theme, metrics) {
+function intentFromTheme(theme, metrics, activeArc) {
   switch (theme) {
+    case "arc_progress":
+      return activeArc?.kind ? `advance_arc_${activeArc.kind}` : "advance_story_arc";
     case "military":
       return metrics.army < 120 ? "stabilize_army" : "expand_military_power";
     case "economy":
@@ -58,32 +59,37 @@ function intentFromTheme(theme, metrics) {
       return "balance_faith_power";
     case "peasantry":
       return "manage_hardship";
-    case "arc_progress":
-      return "advance_story_arc";
     case "court":
     default:
       return "manage_court";
   }
 }
 
-function buildPlannerPacket(metrics, world) {
-  const theme = pickTheme(metrics, world);
+function buildPlannerPacket(metrics, worldRow, activeArcRow, factsRows) {
+  const memory = worldRow?.memory || {};
+  const theme = pickTheme(metrics, memory, activeArcRow);
 
-  const activeArc = (world?.arcs || []).find(a => a.status === "active") || null;
-
-  const facts = Array.isArray(world?.facts) ? world.facts : [];
-  const mustUseFacts = facts
+  const mustUseFacts = (factsRows || [])
     .slice(-6)
     .map(f => f.text)
     .filter(Boolean);
 
+  const arcHint = activeArcRow
+    ? {
+        title: activeArcRow.title,
+        kind: activeArcRow.kind,
+        phase: activeArcRow.phase,
+        stage: activeArcRow.stage,
+        tension: activeArcRow.tension,
+        expiresTurn: activeArcRow.expires_turn
+      }
+    : null;
+
   return {
     theme,
-    intent: intentFromTheme(theme, metrics),
+    intent: intentFromTheme(theme, metrics, activeArcRow),
     difficulty: 1,
-    arcHint: activeArc
-      ? { id: activeArc.id, title: activeArc.title, stage: activeArc.stage, tension: activeArc.tension }
-      : null,
+    arcHint,
     mustUseFacts
   };
 }

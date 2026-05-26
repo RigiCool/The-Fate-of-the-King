@@ -12,13 +12,9 @@ export default function Card({ title, description, choices, onChoice, image }) {
     const diff = clientX - centerX;
     setOffsetX(diff / 4);
 
-    if (diff > 300) {
-      setHoveredIndex(0);
-    } else if (diff < -300) {
-      setHoveredIndex(1);
-    } else {
-      setHoveredIndex(null);
-    }
+    if (diff > 300) setHoveredIndex(0);
+    else if (diff < -300) setHoveredIndex(1);
+    else setHoveredIndex(null);
   };
 
   const handleMouseLeave = () => {
@@ -43,27 +39,21 @@ export default function Card({ title, description, choices, onChoice, image }) {
           transition: hoveredChoice ? "none" : "transform 0.3s ease"
         }}
       >
-        {image && (
+        {image ? (
           <img
             src={image}
             alt={title}
-            style={{
-              maxWidth: "250px",
-              maxHeight: "250px",
-              borderRadius: "8px",
-              marginBottom: "1rem"
-            }}
+            style={{ maxWidth: "250px", maxHeight: "250px", borderRadius: "8px", marginBottom: "1rem" }}
           />
-        )}
+        ) : null}
+
         <h2>{title}</h2>
         <p>{description}</p>
       </div>
 
       {hoveredChoice && (
         <div className={`overlay ${hoveredIndex === 0 ? "right" : "left"}`}>
-          <span className={`card-choice ${hoveredIndex === 0 ? "right" : "left"}`}>
-            {hoveredChoice.text}
-          </span>
+          <span className={`card-choice ${hoveredIndex === 0 ? "right" : "left"}`}>{hoveredChoice.text}</span>
         </div>
       )}
     </div>

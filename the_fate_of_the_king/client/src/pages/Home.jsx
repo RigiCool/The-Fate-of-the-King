@@ -1,6 +1,29 @@
+// src/pages/Home.jsx
 import React, { useState } from "react";
 import Card from "../components/Card";
 import MetricBar from "../components/MetricBar";
+
+function stringifyErrorPayload(payload) {
+  if (!payload) return "Unknown error";
+  if (typeof payload === "string") return payload;
+  if (payload.details) return typeof payload.details === "string" ? payload.details : JSON.stringify(payload.details);
+  if (payload.error) return typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error);
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload);
+  }
+}
+
+async function readJsonSafe(res) {
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) return null;
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
 
 function Home() {
   const [king, setKing] = useState(null);
@@ -19,11 +42,15 @@ function Home() {
         headers: { "Content-Type": "application/json" }
       });
 
-      if (!res.ok) throw new Error("Ошибка при создании короля");
-      const data = await res.json();
-      setKing(data);
+      const payload = await readJsonSafe(res);
+
+      if (!res.ok) {
+        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
+      }
+
+      setKing(payload);
     } catch (err) {
-      setError(err.message);
+      setError(err?.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -42,11 +69,15 @@ function Home() {
         body: JSON.stringify({ kingId: king.id })
       });
 
-      if (!res.ok) throw new Error("Ошибка при генерации карточки");
-      const data = await res.json();
-      setCard(data);
+      const payload = await readJsonSafe(res);
+
+      if (!res.ok) {
+        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
+      }
+
+      setCard(payload);
     } catch (err) {
-      setError(err.message);
+      setError(err?.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -54,6 +85,8 @@ function Home() {
 
   const handleChoice = async (choice, choiceIndex) => {
     if (!king || !card) return;
+
+    setError(null);
 
     try {
       const res = await fetch("http://localhost:3000/apply-choice", {
@@ -63,24 +96,30 @@ function Home() {
           kingId: king.id,
           effects: choice.effects,
           choiceIndex,
+          theme: card?.planner?.theme,
           card: {
             title: card.title,
             description: card.description,
-            choices: card.choices
-          },
-          theme: card?.planner?.theme
+            choices: card.choices,
+            arc: card.arc
+          }
         })
       });
 
-      if (!res.ok) throw new Error("Ошибка обновления метрик");
-      const updatedMetrics = await res.json();
-      setKing((prev) => ({ ...prev, metrics: updatedMetrics }));
+      const payload = await readJsonSafe(res);
 
+      if (!res.ok) {
+        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
+      }
+
+      setKing((prev) => ({ ...prev, metrics: payload }));
       await getCard();
     } catch (err) {
-      setError(err.message);
+      setError(err?.message || String(err));
     }
   };
+
+  const metrics = king?.metrics;
 
   return (
     <div className="home">
@@ -99,12 +138,14 @@ function Home() {
           <h2 className="king-name">{king.name}</h2>
           <p className="king-age">{king.age} years old</p>
 
-          <div className="metrics">
-            <div className="metric">⚔<MetricBar label="Army" value={king.metrics.army} /></div>
-            <div className="metric">💰<MetricBar label="Economy" value={king.metrics.economy} /></div>
-            <div className="metric">🕊<MetricBar label="Diplomacy" value={king.metrics.diplomacy} /></div>
-            <div className="metric">👑<MetricBar label="Loyalty" value={king.metrics.loyalty} /></div>
-          </div>
+          {metrics && (
+            <div className="metrics">
+              <div className="metric">⚔<MetricBar label="Army" value={metrics.army} /></div>
+              <div className="metric">💰<MetricBar label="Economy" value={metrics.economy} /></div>
+              <div className="metric">🕊<MetricBar label="Diplomacy" value={metrics.diplomacy} /></div>
+              <div className="metric">👑<MetricBar label="Loyalty" value={metrics.loyalty} /></div>
+            </div>
+          )}
 
           {!card && (
             <>

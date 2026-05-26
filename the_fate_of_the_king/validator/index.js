@@ -20,9 +20,7 @@ function extractFirstJsonObject(text) {
     const ch = text[i];
     if (ch === "{") depth++;
     if (ch === "}") depth--;
-    if (depth === 0) {
-      return text.slice(start, i + 1);
-    }
+    if (depth === 0) return text.slice(start, i + 1);
   }
   return null;
 }
@@ -53,6 +51,31 @@ function makeValidator(schema) {
 }
 
 
+function normalizeArcSeedLike(arc) {
+  if (!arc || typeof arc !== "object") return undefined;
+
+  const title = String(arc.title ?? "").trim();
+  const kind = String(arc.kind ?? "").trim();
+  const triggerMetric = String(arc.triggerMetric ?? "").trim();
+
+
+  const expectedTurnsRaw = arc.expectedTurns;
+  const expectedTurns = clamp(parseInt(expectedTurnsRaw, 10) || 4, 2, 8);
+
+  const stakes = arc.stakes != null ? String(arc.stakes).trim() : "";
+
+  if (!title) return undefined;
+
+
+  return {
+    title: title.length > 80 ? title.slice(0, 77) + "..." : title,
+    kind,
+    expectedTurns,
+    triggerMetric,
+    stakes: stakes.length > 160 ? stakes.slice(0, 157) + "..." : stakes
+  };
+}
+
 function normalizeCard(card) {
   if (!card || typeof card !== "object") return card;
 
@@ -80,13 +103,18 @@ function normalizeCard(card) {
     };
   });
 
-
   if (out.title.length > 120) out.title = out.title.slice(0, 117) + "...";
   if (out.description.length > 800) out.description = out.description.slice(0, 797) + "...";
   out.choices = out.choices.map(c => ({
     ...c,
     text: c.text.length > 180 ? c.text.slice(0, 177) + "..." : c.text
   }));
+
+
+  const arcNorm = normalizeArcSeedLike(card.arc);
+
+
+  if (arcNorm) out.arc = arcNorm;
 
   return out;
 }
