@@ -6,7 +6,6 @@ const Database = require("better-sqlite3");
 
 const { CARD_SCHEMA } = require("./schema/card_schema.js");
 const { KING_SCHEMA } = require("./schema/king_schema.js");
-
 const { makeValidator, parseStrictJson, normalizeCard } = require("./validator/index.js");
 
 const {
@@ -18,7 +17,6 @@ const {
 } = require("./planner/index.js");
 
 const { createInitialWorldState, applyChoiceToMemory } = require("./world/world_state.js");
-
 const {
   normalizeArcSeed,
   defaultArcSeed,
@@ -35,6 +33,14 @@ const {
   longArcStakesHint
 } = require("./world/arc_manager.js");
 
+const {
+  hashPassword,
+  verifyPassword,
+  signToken,
+  authRequired,
+  adminRequired
+} = require("./auth.js");
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -45,12 +51,22 @@ const MODEL_ID = process.env.MODEL_ID || "arcee-ai/trinity-large-preview:free";
 const db = new Database("./game.db");
 
 db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS kings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
   name TEXT,
   age INTEGER,
   description TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
@@ -132,6 +148,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
 );
 `);
 
+function ensureKingsUserIdColumn() {
+  const cols = db.prepare(`PRAGMA table_info(kings)`).all().map(r => r.name);
+  if (!cols.includes("user_id")) {
+    db.exec(`ALTER TABLE kings ADD COLUMN user_id INTEGER`);
+  }
+}
+ensureKingsUserIdColumn();
+
 function ensureEventsColumns() {
   const cols = db.prepare(`PRAGMA table_info(events)`).all().map(r => r.name);
   const need = [
@@ -142,6 +166,7 @@ function ensureEventsColumns() {
   for (const c of need) if (!cols.includes(c.name)) db.exec(c.sql);
 }
 ensureEventsColumns();
+
 
 function safeJsonParse(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
@@ -184,14 +209,10 @@ async function callOpenRouterWithRetry(body, { retries = 2, baseDelayMs = 400 } 
   throw last;
 }
 
-function modelSupportsJsonSchema(modelId) {
-  const m = String(modelId || "").toLowerCase();
-  if (m.includes("gemma-3-27b-it")) return false;
-  return true;
-}
 
 async function callLLMJson(body, schemaObj) {
-  const useSchema = schemaObj && modelSupportsJsonSchema(body.model);
+
+  const useSchema = schemaObj
   const finalBody = useSchema
     ? { ...body, response_format: { type: "json_schema", json_schema: schemaObj } }
     : body;
@@ -228,7 +249,7 @@ function clampMetric(x) {
 }
 
 function getKingRow(kingId) {
-  return db.prepare(`SELECT id, name, age, description FROM kings WHERE id=?`).get(kingId) || null;
+  return db.prepare(`SELECT id, user_id, name, age, description, created_at FROM kings WHERE id=?`).get(kingId) || null;
 }
 
 function getMetrics(kingId) {
@@ -417,60 +438,189 @@ function insertDecisionFactAlways({ kingId, turn, theme, card, choiceIndex }) {
     kingId,
     turn,
     tags: [theme || "event", "decision"],
-    text: `Решение короля (${title || "событие"}): ${choiceText}`
+    text: `King's decision (${title || "event"}): ${choiceText}`
   });
 }
 
 function insertImpactFacts({ kingId, turn, theme, effects }) {
   const deltas = [
-    ["army", effects?.army || 0, "армия"],
-    ["economy", effects?.economy || 0, "казна"],
-    ["diplomacy", effects?.diplomacy || 0, "дипломатия"],
-    ["loyalty", effects?.loyalty || 0, "лояльность"]
+    ["army", effects?.army || 0, "army"],
+    ["economy", effects?.economy || 0, "economy"],
+    ["diplomacy", effects?.diplomacy || 0, "diplomacy"],
+    ["loyalty", effects?.loyalty || 0, "loyalty"]
   ];
   for (const [k, d, label] of deltas) {
     if (Math.abs(d) >= 10) {
-      const sign = d > 0 ? "выросла" : "упала";
+      const sign = d > 0 ? "increased" : "decreased";
       maybeInsertFact({
         kingId,
         turn,
         tags: [theme || "event", k, "impact"],
-        text: `Последствие решения: ${label} заметно ${sign} (Δ${k}=${d}).`
+        text: `Decision consequence: ${label} significantly ${sign} (Δ${k}=${d}).`
       });
     }
   }
 }
 
-app.post("/debug/rebuild-fts", (req, res) => {
+function requireKingAccess(req, res, next) {
+  const kingId = Number(req.params.kingId || req.body?.kingId);
+  if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
+
+  const king = getKingRow(kingId);
+  if (!king) return res.status(404).json({ error: "King not found" });
+
+  // admin can access all
+  if (req.user?.role === "admin") {
+    req.king = king;
+    return next();
+  }
+
+  if (king.user_id !== req.user.id) {
+    return res.status(403).json({ error: "No access to this king" });
+  }
+
+  req.king = king;
+  next();
+}
+
+app.post("/auth/register", async (req, res) => {
   try {
-    db.exec(`DELETE FROM knowledge_fts;`);
+    const { email, password } = req.body || {};
+    const e = String(email || "").trim().toLowerCase();
+    const p = String(password || "");
 
-    const rows = db.prepare(`
-      SELECT id, king_id, turn, tags_json, text
-      FROM knowledge
-      ORDER BY id ASC
-    `).all();
+    if (!e || !p || p.length < 6) {
+      return res.status(400).json({ error: "Email and password are required (password must be at least 6 characters)" });
+    }
 
-    const stmt = db.prepare(`
-      INSERT INTO knowledge_fts (rowid, text, tags, king_id, turn)
-      VALUES (?, ?, ?, ?, ?)
-    `);
+    const exists = db.prepare(`SELECT id FROM users WHERE email=?`).get(e);
+    if (exists) return res.status(409).json({ error: "Email is already registered" });
 
-    const tx = db.transaction(() => {
-      for (const r of rows) {
-        const tags = normalizeTags(safeJsonParse(r.tags_json, []));
-        stmt.run(r.id, r.text, tags.join(" "), r.king_id, r.turn);
-      }
-    });
+    const passwordHash = await hashPassword(p);
+    const info = db.prepare(`INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'user')`).run(e, passwordHash);
 
-    tx();
-    res.json({ ok: true, rebuilt: rows.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e).slice(0, 1000) });
+    const user = { id: info.lastInsertRowid, email: e, role: "user" };
+    const token = signToken(user);
+    res.json({ token, user });
+  } catch (err) {
+    res.status(500).json({ error: "register failed", details: String(err?.message || err).slice(0, 1000) });
   }
 });
 
-app.post("/start-game", async (req, res) => {
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const e = String(email || "").trim().toLowerCase();
+    const p = String(password || "");
+
+    const u = db.prepare(`SELECT id, email, password_hash, role FROM users WHERE email=?`).get(e);
+    if (!u) return res.status(401).json({ error: "Invalid email or password" });
+
+    const ok = await verifyPassword(p, u.password_hash);
+    if (!ok) return res.status(401).json({ error: "Invalid login or password" });
+
+    const user = { id: u.id, email: u.email, role: u.role };
+    const token = signToken(user);
+    res.json({ token, user });
+  } catch (err) {
+    res.status(500).json({ error: "login failed", details: String(err?.message || err).slice(0, 1000) });
+  }
+});
+
+app.get("/me", authRequired, (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.get("/kings", authRequired, (req, res) => {
+  const rows = db.prepare(`
+    SELECT k.id, k.name, k.age, k.created_at,
+           ws.turn AS turn
+    FROM kings k
+    LEFT JOIN world_state ws ON ws.king_id = k.id
+    WHERE k.user_id = ?
+    ORDER BY k.id DESC
+  `).all(req.user.id);
+
+  const out = rows.map(r => {
+    const activeArc = db.prepare(`SELECT title, status, phase FROM arcs WHERE king_id=? AND status='active' LIMIT 1`).get(r.id);
+    const lastOutcome = db.prepare(`
+      SELECT text, turn
+      FROM knowledge
+      WHERE king_id=? AND kind='arc_outcome'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(r.id);
+
+    return {
+      kingId: r.id,
+      name: r.name,
+      age: r.age,
+      createdAt: r.created_at,
+      turn: r.turn ?? 0,
+      activeArc: activeArc ? { title: activeArc.title, status: activeArc.status, phase: activeArc.phase } : null,
+      lastArcOutcome: lastOutcome ? { turn: lastOutcome.turn, text: lastOutcome.text } : null
+    };
+  });
+
+  res.json({ kings: out });
+});
+
+app.get("/kings/:kingId", authRequired, requireKingAccess, (req, res) => {
+  const kingId = Number(req.params.kingId);
+
+  const king = getKingRow(kingId);
+  if (!king) return res.status(404).json({ error: "Король не найден" });
+
+  const metrics = getMetrics(kingId);
+  const ws = getWorldRow(kingId);
+
+  res.json({
+    id: king.id,
+    name: king.name,
+    age: king.age,
+    description: king.description,
+    createdAt: king.created_at,
+    metrics: metrics || { army: 150, economy: 150, diplomacy: 150, loyalty: 150 },
+    turn: ws?.turn ?? 0
+  });
+});
+
+app.get("/kings/:kingId/history", authRequired, requireKingAccess, (req, res) => {
+  const kingId = Number(req.params.kingId);
+  const king = req.king;
+
+  const lastEvents = db.prepare(`
+    SELECT turn, card_json, chosen_index
+    FROM events
+    WHERE king_id=? AND chosen_index IS NOT NULL
+    ORDER BY turn DESC
+    LIMIT 12
+  `).all(kingId).map(r => {
+    const card = safeJsonParse(r.card_json, null);
+    return {
+      turn: r.turn,
+      title: String(card?.title || ""),
+      choiceIndex: r.chosen_index,
+      choiceText: String(card?.choices?.[r.chosen_index]?.text || "")
+    };
+  });
+
+  const arcOutcomes = db.prepare(`
+    SELECT turn, text
+    FROM knowledge
+    WHERE king_id=? AND kind='arc_outcome'
+    ORDER BY id DESC
+    LIMIT 10
+  `).all(kingId);
+
+  res.json({
+    king: { id: king.id, name: king.name, age: king.age, description: king.description, createdAt: king.created_at },
+    lastEvents,
+    arcOutcomes
+  });
+});
+
+app.post("/kings/start", authRequired, async (req, res) => {
   try {
     const data = await callLLMJson(
       {
@@ -485,7 +635,7 @@ app.post("/start-game", async (req, res) => {
 
     const content = data.choices?.[0]?.message?.content;
     const king = parseStrictJson(content);
-    if (!king) return res.status(500).json({ error: "Не удалось создать короля: неверный JSON" });
+    if (!king) return res.status(500).json({ error: "Failed to create king: Invalid JSON" });
 
     const nk = {
       name: String(king.name || "").trim(),
@@ -494,12 +644,14 @@ app.post("/start-game", async (req, res) => {
     };
 
     const v = validateKing(nk);
-    if (!v.ok) return res.status(500).json({ error: "Король не прошёл валидацию", details: v.errors });
+    if (!v.ok) return res.status(500).json({ error: "King failed validation", details: v.errors });
 
-    const result = db.prepare(`INSERT INTO kings (name, age, description) VALUES (?, ?, ?)`).run(nk.name, nk.age, nk.description);
+    const result = db.prepare(`INSERT INTO kings (user_id, name, age, description) VALUES (?, ?, ?, ?)`)
+      .run(req.user.id, nk.name, nk.age, nk.description);
     const kingId = result.lastInsertRowid;
 
-    db.prepare(`INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty) VALUES (?, 150, 150, 150, 150)`).run(kingId);
+    db.prepare(`INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty) VALUES (?, 150, 150, 150, 150)`)
+      .run(kingId);
 
     const ws = createInitialWorldState(nk);
     ws.memory = ensureArcCadenceMemory(ws.memory || {});
@@ -517,7 +669,7 @@ app.post("/start-game", async (req, res) => {
       kind: "fact",
       turn: 0,
       tags: ["king", "origin"],
-      text: `Король ${nk.name}: ${nk.description}`
+      text: `King ${nk.name}: ${nk.description}`
     });
 
     res.json({
@@ -526,18 +678,16 @@ app.post("/start-game", async (req, res) => {
       metrics: { army: 150, economy: 150, diplomacy: 150, loyalty: 150 }
     });
   } catch (err) {
-    console.warn("Ошибка генерации короля:", err.message);
-    res.status(500).json({ error: "Не удалось создать короля", details: String(err.message).slice(0, 1200) });
+    res.status(500).json({ error: "Failed to create king", details: String(err?.message || err).slice(0, 1200) });
   }
 });
 
-app.post("/get-card", async (req, res) => {
+app.post("/kings/:kingId/get-card", authRequired, requireKingAccess, async (req, res) => {
   try {
-    const { kingId } = req.body || {};
-    if (!kingId) return res.status(400).json({ error: "Нужен kingId" });
+    const kingId = Number(req.params.kingId);
 
     const metrics = getMetrics(kingId);
-    if (!metrics) return res.status(404).json({ error: "Метрики не найдены" });
+    if (!metrics) return res.status(404).json({ error: "No metrics found" });
 
     const kingRow = getKingRow(kingId);
     const kingName = kingRow?.name ? String(kingRow.name) : "";
@@ -578,11 +728,7 @@ app.post("/get-card", async (req, res) => {
 
     const existingCard = getEventCardByTurn(kingId, nextTurn);
     if (existingCard) {
-      return res.json({
-        ...existingCard,
-        turn: nextTurn,
-        planner: { reused: true }
-      });
+      return res.json({ ...existingCard, turn: nextTurn, planner: { reused: true } });
     }
 
     const activeArc = getActiveArc(kingId);
@@ -601,7 +747,8 @@ app.post("/get-card", async (req, res) => {
       (!!pending && pendingArcId != null && pendingArcId !== lastFinaleArcId) ||
       (!!pendingKey && worldRow.memory.lastFinaleKey !== pendingKey);
 
-    const arcStartEligible = !activeArc && !isFinale && isArcStartEligible({ memory: worldRow.memory, currentTurn: nextTurn });
+    const arcStartEligible = !activeArc && !isFinale &&
+      isArcStartEligible({ memory: worldRow.memory, currentTurn: nextTurn });
 
     let recentSummaries = [];
     let recentBlock = "- (none)";
@@ -614,13 +761,7 @@ app.post("/get-card", async (req, res) => {
     if (isFinale) {
       const coreQuery = `tags:king OR tags:origin`;
       const titlePart = String(pending?.title || "").replace(/[^\p{L}\p{N}_-]+/gu, " ").trim();
-      const situationalQuery = [
-        "tags:arc",
-        "tags:outcome",
-        "tags:start",
-        "tags:event",
-        titlePart ? titlePart : ""
-      ].filter(Boolean).join(" OR ");
+      const situationalQuery = ["tags:arc", "tags:outcome", "tags:start", "tags:event", titlePart].filter(Boolean).join(" OR ");
 
       const core = retrieveKnowledgeFTS(db, { kingId, query: coreQuery, topK: 3 });
       const situational = retrieveKnowledgeFTS(db, { kingId, query: situationalQuery, topK: 16 });
@@ -643,31 +784,15 @@ app.post("/get-card", async (req, res) => {
       const totalTurns = Math.max(1, (activeArc.expires_turn - activeArc.created_turn));
       const progressTurns = Math.max(0, nextTurn - activeArc.created_turn);
       const remainingTurns = Math.max(0, activeArc.expires_turn - nextTurn);
-
-      arcPacing = {
-        totalTurns,
-        progressTurns,
-        remainingTurns,
-        isLongArc: totalTurns >= 6
-      };
+      arcPacing = { totalTurns, progressTurns, remainingTurns, isLongArc: totalTurns >= 6 };
     }
 
     const directive = isFinale
-      ? {
-          mode: "arc_resolution",
-          arc: pending,
-          note: "EPILOGUE: Must explicitly close the arc. No new conflict. No new arc seed. Choices ceremonial (zero effects)."
-        }
-      : {
-          mode: "normal",
-          theme: planner.theme,
-          intent: planner.intent,
-          arcDirective: planner.arcDirective,
-          arcStartEligible
-        };
+      ? { mode: "arc_resolution", arc: pending, note: "EPILOGUE: Must explicitly close the arc. No new conflict. No new arc seed. Choices ceremonial (zero effects)." }
+      : { mode: "normal", theme: planner.theme, intent: planner.intent, arcDirective: planner.arcDirective, arcStartEligible };
 
-    const finaleChoiceA = "Принять итог и продолжить правление";
-    const finaleChoiceB = "Закрепить исход и продолжить правление";
+    const finaleChoiceA = "Accept the outcome and continue the reign.";
+    const finaleChoiceB = "Secure the outcome and continue the reign.";
 
     const antiRepeatSection = (!activeArc && !isFinale)
       ? `Anti-repeat (DO NOT repeat these recent situations):\n${recentBlock}\n`
@@ -702,11 +827,11 @@ Effects must be integers [-20..20].
 Mode guidance:
 - If there is an ACTIVE arc: advance the arc with new development (not repetition). Escalate or reveal new information.
 - If there is NO active arc:
-  - If arcStartEligible=false: generate a small standalone "side quest" / quick court matter (merchant, dispute, local issue). It must still reference world facts, but MUST NOT propose a new long arc.
-  - If arcStartEligible=true: you MAY propose a new arc seed by including "arc" object, but only if it naturally fits.
+  - If arcStartEligible=false: generate a small standalone "side quest". MUST NOT propose a new long arc.
+  - If arcStartEligible=true: you MAY propose a new arc seed by including "arc" object.
 
 Special rule for LONG arcs (totalTurns >= 6):
-- Include investigation / mystery / trail of clues or treasure hunt style progression: each arc step reveals a NEW clue, witness, map fragment, coded letter, or hidden stash.
+- Include investigation / mystery / trail of clues or treasure hunt progression.
 
 Arc seed rule:
 - If arcStartEligible is false, DO NOT include "arc" field.
@@ -715,7 +840,7 @@ Arc seed rule:
 Return ONLY JSON matching schema.
 `.trim();
 
-    const label = `LLM generation ${kingId} ${Date.now()}`;
+    const label = `LLM generation king=${kingId} turn=${nextTurn} ${Date.now()}`;
     console.time(label);
 
     let data;
@@ -733,16 +858,18 @@ Return ONLY JSON matching schema.
     } finally {
       console.timeEnd(label);
     }
+
     console.log(prompt);
+
     const content = data.choices?.[0]?.message?.content;
-    if (!content) return res.status(500).json({ error: "Пустой ответ LLM" });
+    if (!content) return res.status(500).json({ error: "Empty LLM response" });
 
     let card = normalizeCard(parseStrictJson(content));
 
     if (isFinale) {
       const t = String(card.title || "").trim();
-      if (!/^Эпилог:|^Развязка:/i.test(t)) {
-        card.title = `Эпилог: ${t || (pending?.title ? pending.title : "Итог арки")}`.slice(0, 120);
+      if (!/^Epilogue:|^Finale:/i.test(t)) {
+        card.title = `Epilogue: ${t || (pending?.title ? pending.title : "Finale of the arc")}`.slice(0, 120);
       }
 
       card.choices = [
@@ -753,31 +880,28 @@ Return ONLY JSON matching schema.
       if (card.arc) delete card.arc;
 
       const d = String(card.description || "").trim();
-      const has1 = d.includes("Арка завершилась:");
-      const has2 = d.includes("Цена:");
-      const has3 = d.includes("Теперь:");
+      const has1 = d.includes("Arc concluded:");
+      const has2 = d.includes("Price:");
+      const has3 = d.includes("Now:");
       if (!(has1 && has2 && has3)) {
         const outcome = String(pending?.outcome || "").trim();
         const patch = [
-          has1 ? null : `Арка завершилась: ${outcome || "кризис получил ясный исход."}`,
-          has2 ? null : `Цена: решение оставило след в людях и казне.`,
-          has3 ? null : `Теперь: король продолжает правление в новом порядке вещей.`
+          has1 ? null : `Arc concluded: ${outcome || "the crisis had a clear resolution."}`,
+          has2 ? null : `Price: the decision left a mark on the people and treasury.`,
+          has3 ? null : `Now: the king continues to rule in a new order of things.`
         ].filter(Boolean).join("\n");
         card.description = `${d}\n\n${patch}`.trim().slice(0, 800);
       }
     } else {
-      if (!arcStartEligible && card.arc) {
-        delete card.arc;
-      }
+      if (!arcStartEligible && card.arc) delete card.arc;
     }
 
     const vv = validateCard(card);
-    if (!vv.ok) return res.status(500).json({ error: "Карточка не прошла валидацию", details: vv.errors });
+    if (!vv.ok) return res.status(500).json({ error: "Card failed validation", details: vv.errors });
 
     try {
       card.image = await generateImage(`${card.title}. Medieval illustration, dark, dramatic, cinematic.`);
-    } catch (e) {
-      console.warn("Image generation failed:", String(e.message).slice(0, 160));
+    } catch {
       card.image = null;
     }
 
@@ -798,44 +922,30 @@ Return ONLY JSON matching schema.
     res.json({
       ...card,
       turn: nextTurn,
-      planner: {
-        theme: planner.theme,
-        intent: planner.intent,
-        mode: directive.mode,
-        arcStartEligible
-      },
-      debug: {
-        isFinale,
-        arcStartEligible,
-        nextArcStartTurn: worldRow.memory?.nextArcStartTurn ?? null,
-        anchorsCount: anchorItems.length,
-        recentCount: recentSummaries.length
-      }
+      planner: { theme: planner.theme, intent: planner.intent, mode: directive.mode, arcStartEligible }
     });
   } catch (err) {
-    console.warn("Ошибка генерации карточки:", err?.message);
-    res.status(500).json({
-      error: "Не удалось сгенерировать карточку",
-      details: String(err?.message || err).slice(0, 1400)
-    });
+    res.status(500).json({ error: "Failed to generate card", details: String(err?.message || err).slice(0, 1400) });
   }
 });
 
-app.post("/apply-choice", (req, res) => {
-  const { kingId, effects, choiceIndex, card, theme } = req.body || {};
-  if (!kingId || !effects) return res.status(400).json({ error: "Нужны kingId и effects" });
+app.post("/kings/:kingId/apply-choice", authRequired, requireKingAccess, (req, res) => {
+  const kingId = Number(req.params.kingId);
+  const { effects, choiceIndex, card, theme } = req.body || {};
+
+  if (!effects) return res.status(400).json({ error: "Need effects" });
 
   try {
     const metrics = getMetrics(kingId);
-    if (!metrics) return res.status(404).json({ error: "Метрики не найдены" });
+    if (!metrics) return res.status(404).json({ error: "No metrics found" });
 
     let worldRow = getWorldRow(kingId);
-    if (!worldRow) return res.status(500).json({ error: "world_state не найден" });
+    if (!worldRow) return res.status(500).json({ error: "world_state not found" });
 
     worldRow.memory = ensureArcCadenceMemory(worldRow.memory || {});
 
     const ci = Number.isInteger(choiceIndex) ? choiceIndex : null;
-    if (!(card && (ci === 0 || ci === 1))) return res.status(400).json({ error: "Нужны card и choiceIndex 0/1" });
+    if (!(card && (ci === 0 || ci === 1))) return res.status(400).json({ error: "Need card and choiceIndex 0/1" });
 
     const supposedTurn = (worldRow.turn ?? 0) + 1;
     const isFinaleChoice =
@@ -858,9 +968,8 @@ app.post("/apply-choice", (req, res) => {
       loyalty: clampMetric(metrics.loyalty + (eff.loyalty || 0))
     };
 
-    db.prepare(`UPDATE metrics SET army=?, economy=?, diplomacy=?, loyalty=? WHERE king_id=?`).run(
-      updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId
-    );
+    db.prepare(`UPDATE metrics SET army=?, economy=?, diplomacy=?, loyalty=? WHERE king_id=?`)
+      .run(updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId);
 
     const mergedWorld = applyChoiceToMemory(worldRow, card, ci, theme);
     mergedWorld.memory = ensureArcCadenceMemory(mergedWorld.memory || {});
@@ -897,8 +1006,8 @@ app.post("/apply-choice", (req, res) => {
       turn: mergedWorld.turn,
       tags: [theme || "event", "event"],
       text:
-        `Ход ${mergedWorld.turn}. ${String(card.title || "").trim()} — ${String(card.description || "").trim().slice(0, 220)}. ` +
-        `Выбор: "${String(card.choices?.[ci]?.text || "").trim().slice(0, 200)}".`
+        `Turn ${mergedWorld.turn}. ${String(card.title || "").trim()} — ${String(card.description || "").trim().slice(0, 220)}. ` +
+        `Choice: "${String(card.choices?.[ci]?.text || "").trim().slice(0, 200)}".`
     });
 
     if (!isFinaleChoice) {
@@ -959,7 +1068,7 @@ app.post("/apply-choice", (req, res) => {
           refId: activeArc.id,
           turn: mergedWorld.turn,
           tags: ["arc", advanced.kind, "outcome", advanced.status],
-          text: `Развязка арки "${advanced.title}": ${advanced.outcome_text}`
+          text: `Resolved arc "${advanced.title}": ${advanced.outcome_text}`
         });
       }
     }
@@ -974,7 +1083,6 @@ app.post("/apply-choice", (req, res) => {
       const lastArc = wNow?.memory?.lastArc || null;
 
       const rawSeed = normalizeArcSeed(card.arc) || defaultArcSeed(updated);
-
       const pickedLen = pickArcLengthFromHistory(wNow.memory.arcLengthHistory);
       const seed = enforceArcSeedTurns(rawSeed, pickedLen);
 
@@ -1020,7 +1128,7 @@ app.post("/apply-choice", (req, res) => {
           refId: info.lastInsertRowid,
           turn: mergedWorld.turn,
           tags: startTags,
-          text: `Началась арка "${newArc.title}" (${newArc.kind}, ${pickedLen} ходов). Ставки: ${newArc.stakes}`
+          text: `Started arc "${newArc.title}" (${newArc.kind}, ${pickedLen} turns). Stakes: ${newArc.stakes}`
         });
 
         saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
@@ -1032,13 +1140,31 @@ app.post("/apply-choice", (req, res) => {
 
     res.json(updated);
   } catch (err) {
-    console.error("Ошибка apply-choice:", err?.message);
-    res.status(500).json({
-      error: "Не удалось применить выбор",
-      details: String(err?.message || err).slice(0, 1400)
-    });
+    res.status(500).json({ error: "Failed to apply choice", details: String(err?.message || err).slice(0, 1400) });
   }
 });
 
+app.patch("/admin/kings/:kingId/metrics", authRequired, adminRequired, (req, res) => {
+  const kingId = Number(req.params.kingId);
+  if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
+
+  const { army, economy, diplomacy, loyalty } = req.body || {};
+  const current = getMetrics(kingId);
+  if (!current) return res.status(404).json({ error: "No metrics found" });
+
+  const updated = {
+    army: clampMetric(army ?? current.army),
+    economy: clampMetric(economy ?? current.economy),
+    diplomacy: clampMetric(diplomacy ?? current.diplomacy),
+    loyalty: clampMetric(loyalty ?? current.loyalty)
+  };
+
+  db.prepare(`UPDATE metrics SET army=?, economy=?, diplomacy=?, loyalty=? WHERE king_id=?`)
+    .run(updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId);
+
+  res.json({ ok: true, kingId, metrics: updated });
+});
+
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

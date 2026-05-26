@@ -1,5 +1,3 @@
-planner/retrieval.js
-
 function retrieveKnowledgeFTS(db, { kingId, query, topK = 10 }) {
   const q = String(query || "").trim();
   if (!q) return [];

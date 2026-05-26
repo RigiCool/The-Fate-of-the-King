@@ -1,6 +1,8 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import Card from "../components/Card";
 import MetricBar from "../components/MetricBar";
+import { useAuth } from "../auth/AuthContext";
 
 async function readErrorMessage(res) {
   const text = await res.text().catch(() => "");
@@ -13,11 +15,47 @@ async function readErrorMessage(res) {
   }
 }
 
-function Home() {
+export default function Home() {
+  const { token, logout, user } = useAuth();
+  const navigate = useNavigate();
+  const { kingId } = useParams();
+
+  const API = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+
+  const authHeaders = useMemo(() => {
+    const h = { "Content-Type": "application/json" };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  }, [token]);
+
   const [king, setKing] = useState(null);
   const [card, setCard] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [gameOver, setGameOver] = useState(false);
+
+
+  useEffect(() => {
+    if (!kingId) return;
+
+    (async () => {
+      setLoading(true);
+      setError(null);
+      setCard(null);
+
+      try {
+        const res = await fetch(`${API}/kings/${kingId}`, { headers: authHeaders });
+        if (!res.ok) throw new Error(await readErrorMessage(res));
+        const data = await res.json();
+        setKing(data);
+      } catch (e) {
+        setError(e?.message || String(e));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [kingId, API, authHeaders]);
+
 
   const startGame = async () => {
     setLoading(true);
@@ -25,15 +63,16 @@ function Home() {
     setCard(null);
 
     try {
-      const res = await fetch("http://localhost:3000/start-game", {
+      const res = await fetch(`${API}/kings/start`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" }
+        headers: authHeaders,
       });
 
       if (!res.ok) throw new Error(await readErrorMessage(res));
       const data = await res.json();
 
       setKing(data);
+      if (data?.id != null) navigate(`/play/${data.id}`, { replace: true });
     } catch (err) {
       setError(err?.message || String(err));
     } finally {
@@ -41,22 +80,21 @@ function Home() {
     }
   };
 
+
   const getCard = async () => {
-    if (!king) return;
+    if (!king?.id) return;
 
     setLoading(true);
     setError(null);
 
     try {
-      const res = await fetch("http://localhost:3000/get-card", {
+      const res = await fetch(`${API}/kings/${king.id}/get-card`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kingId: king.id })
+        headers: authHeaders,
       });
 
       if (!res.ok) throw new Error(await readErrorMessage(res));
       const data = await res.json();
-
       setCard(data);
     } catch (err) {
       setError(err?.message || String(err));
@@ -65,17 +103,17 @@ function Home() {
     }
   };
 
+
   const handleChoice = async (choice, choiceIndex) => {
-    if (!king || !card) return;
+    if (!king?.id || !card) return;
 
     setError(null);
 
     try {
-      const res = await fetch("http://localhost:3000/apply-choice", {
+      const res = await fetch(`${API}/kings/${king.id}/apply-choice`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders,
         body: JSON.stringify({
-          kingId: king.id,
           effects: choice.effects,
           choiceIndex,
           theme: card?.planner?.theme,
@@ -83,42 +121,67 @@ function Home() {
             title: card.title,
             description: card.description,
             choices: card.choices,
-            arc: card.arc
-          }
-        })
+            arc: card.arc,
+          },
+        }),
       });
 
       if (!res.ok) throw new Error(await readErrorMessage(res));
-      const updatedMetrics = await res.json();
+      const data = await res.json();
 
-      setKing((prev) => ({ ...prev, metrics: updatedMetrics }));
+      setKing((prev) => ({ ...prev, metrics: data }));
 
+      setGameOver(data?.gameOver || false);
+      console.log("Game over?", gameOver, "Server said:", data);
       await getCard();
     } catch (err) {
       setError(err?.message || String(err));
     }
   };
 
+  const redirect = () => {
+    setTimeout(() => {
+      window.location.href = "/kings";
+    }, 1200);
+  };
+
   const metrics = king?.metrics;
 
   return (
     <div className="home">
-      <h1>The Fate of the King</h1>
+      <div className="header">
+        <div style={{ display: "flex", flexDirection: "column", lineHeight: 1 }}>
+          <h1 style={{ margin: 0 }}>The Fate of the King</h1>
+          <h2 style={{ margin: 0 }}>Home</h2>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <Link className="nav-link active" to="/" style={{ opacity: 0.9 }}>Home</Link>
+          <Link className="nav-link" to="/kings" style={{ opacity: 0.9 }}>Kings</Link>
+
+          {user?.role === "admin" && (
+            <Link className="nav-link" to="/admin/metrics" style={{ opacity: 0.9, marginLeft: 10 }}> Metrics </Link>
+          )}
+
+          <div className="profile-link">{user?.email ? user.email : "Logged in"}</div>
+          <button className="btn" onClick={logout}>Logout</button>
+        </div>
+      </div>
+
+      {error && <p style={{ color: "red" }}>Ошибка: {error}</p>}
 
       {!king && (
-        <button onClick={startGame} disabled={loading}>
+        <button className="btn" onClick={startGame} disabled={loading} style={{ marginTop: 12 }}>
           {loading ? "Генерация..." : "Начать игру"}
         </button>
       )}
 
-      {error && <p style={{ color: "red" }}>Ошибка: {error}</p>}
-
       {king && (
-        <div className={`card ${card ? "king-title" : "king-card"}`}>
+        <div className={`card ${card ? "king-title" : "king-card"}`} style={{ marginTop: 12 }}>
           <h2 className="king-name">{king.name}</h2>
           <p className="king-age">{king.age} years old</p>
 
-          {metrics && (
+          {metrics && card && (
             <div className="metrics">
               <div className="metric">⚔<MetricBar label="Army" value={metrics.army} /></div>
               <div className="metric">💰<MetricBar label="Economy" value={metrics.economy} /></div>
@@ -130,7 +193,7 @@ function Home() {
           {!card && (
             <>
               <p>{king.description}</p>
-              <button onClick={getCard} disabled={loading}>
+              <button className="btn" onClick={getCard} disabled={loading}>
                 {loading ? "Генерация события..." : "Начать испытания"}
               </button>
             </>
@@ -141,13 +204,11 @@ function Home() {
       {card && (
         <>
           {card?.planner?.mode === "arc_resolution" && (
-            <p style={{ opacity: 0.8 }}>📜 Развязка сюжетной арки</p>
+            <p style={{ opacity: 0.8 }}>Развязка сюжетной арки</p>
           )}
-          <Card {...card} onChoice={handleChoice} />
+          <Card {...card} onChoice={gameOver ? redirect : handleChoice}/>
         </>
       )}
     </div>
   );
 }
-
-export default Home;

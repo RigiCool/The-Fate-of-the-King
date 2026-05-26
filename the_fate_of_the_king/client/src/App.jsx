@@ -1,17 +1,3 @@
-//--------------------------------------------------Version: 6.0.0--------------------------------------------------
-// import React from 'react';
-// import Home from './pages/Home';
-
-// function App() {
-//   return <Home />;
-// }
-
-// export default App;
-//--------------------------------------------------Version: 6.0.0--------------------------------------------------
-
-
-//--------------------------------------------------Version: 7.0.0--------------------------------------------------
-// src/App.jsx
 import React from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
@@ -73,6 +59,3 @@ export default function App() {
     </AuthProvider>
   );
 }
-
-
-//--------------------------------------------------Version: 7.0.0--------------------------------------------------
