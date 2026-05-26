@@ -108,7 +108,6 @@ function retrieveKnowledgeFTS(db, { kingId, query, topK = 10 }) {
       score: r.score
     }));
   } catch (e) {
-
     try {
       const fallback = q.split(/\s+OR\s+/).slice(0, 6).join(" ");
       const rows2 = db.prepare(`

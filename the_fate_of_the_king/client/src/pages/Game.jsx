@@ -23,9 +23,7 @@ function Game() {
   }
 
   useEffect(() => {
-
     fetchCard();
-
   }, [kingId]);
 
   async function handleChoice(choice, idx) {
@@ -35,7 +33,6 @@ function Game() {
     setBusy(true);
 
     try {
-
       await api.applyChoice(kingId, {
         effects: choice.effects,
         choiceIndex: idx,
@@ -61,12 +58,12 @@ function Game() {
 
       {!card && (
         <button onClick={fetchCard} disabled={loading || busy}>
-          Начать игру
+          Start Game
         </button>
       )}
 
       {err && <p style={{ color: "crimson" }}>{err}</p>}
-      {loading && <p>Загрузка...</p>}
+      {loading && <p>Loading...</p>}
 
       {card && (
         <div className="card">

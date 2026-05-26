@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS kings (
   age INTEGER,
   description TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  reign_ended INTEGER DEFAULT 0,
   FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -209,9 +210,7 @@ async function callOpenRouterWithRetry(body, { retries = 2, baseDelayMs = 400 } 
   throw last;
 }
 
-
 async function callLLMJson(body, schemaObj) {
-
   const useSchema = schemaObj
   const finalBody = useSchema
     ? { ...body, response_format: { type: "json_schema", json_schema: schemaObj } }
@@ -246,6 +245,32 @@ function clampMetric(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(300, Math.round(n)));
+}
+
+function getRecentKingsForUser(userId, limit = 5) {
+  const rows = db.prepare(`
+    SELECT k.id, k.name, k.description, ws.turn
+    FROM kings k
+    LEFT JOIN world_state ws ON ws.king_id = k.id
+    WHERE k.user_id = ?
+    ORDER BY k.id DESC
+    LIMIT ?
+  `).all(userId, limit);
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    description: String(r.description || "").slice(0, 180),
+    turn: r.turn ?? 0
+  }));
+}
+
+function buildDynastyMemoryBlock(kings) {
+  if (!kings.length) return "No previous kings.";
+
+  return kings.map((k, i) => {
+    return `${i + 1}. King ${k.name} (reign length: ${k.turn} turns) — ${k.description}`;
+  }).join("\n");
 }
 
 function getKingRow(kingId) {
@@ -462,6 +487,14 @@ function insertImpactFacts({ kingId, turn, theme, effects }) {
   }
 }
 
+function checkGameOver(metrics) {
+  if (metrics.army <= 0) return { type: "army", text: "The army has collapsed. The realm is defenseless." };
+  if (metrics.economy <= 0) return { type: "economy", text: "The treasury is empty. The kingdom falls into ruin." };
+  if (metrics.diplomacy <= 0) return { type: "diplomacy", text: "All alliances are broken. Enemies surround the throne." };
+  if (metrics.loyalty <= 0) return { type: "loyalty", text: "The people have turned against their king." };
+  return null;
+}
+
 function requireKingAccess(req, res, next) {
   const kingId = Number(req.params.kingId || req.body?.kingId);
   if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
@@ -469,7 +502,6 @@ function requireKingAccess(req, res, next) {
   const king = getKingRow(kingId);
   if (!king) return res.status(404).json({ error: "King not found" });
 
-  // admin can access all
   if (req.user?.role === "admin") {
     req.king = king;
     return next();
@@ -533,7 +565,7 @@ app.get("/me", authRequired, (req, res) => {
 
 app.get("/kings", authRequired, (req, res) => {
   const rows = db.prepare(`
-    SELECT k.id, k.name, k.age, k.created_at,
+    SELECT k.id, k.name, k.age, k.created_at, k.reign_ended,
            ws.turn AS turn
     FROM kings k
     LEFT JOIN world_state ws ON ws.king_id = k.id
@@ -557,6 +589,7 @@ app.get("/kings", authRequired, (req, res) => {
       age: r.age,
       createdAt: r.created_at,
       turn: r.turn ?? 0,
+      reign_ended: r.reign_ended ?? 0,
       activeArc: activeArc ? { title: activeArc.title, status: activeArc.status, phase: activeArc.phase } : null,
       lastArcOutcome: lastOutcome ? { turn: lastOutcome.turn, text: lastOutcome.text } : null
     };
@@ -622,20 +655,68 @@ app.get("/kings/:kingId/history", authRequired, requireKingAccess, (req, res) =>
 
 app.post("/kings/start", authRequired, async (req, res) => {
   try {
+
+    const recentKings = getRecentKingsForUser(req.user.id, 5);
+    const dynastyMemory = buildDynastyMemoryBlock(recentKings);
+
+    const king_system_prompt = `
+ROLE: You are a professional dark medieval narrative designer.
+
+DESIGN RULES:
+- Grounded medieval setting. No modern tech.
+- Maintain internal world consistency.
+- Avoid trivial flavor events
+- Avoid repetition of previously used structures.
+- The new king must feel historically distinct.
+- Description 4 of 10
+- Temperature 1
+Return ONLY valid JSON.
+    `.trim()
+
+    const king_prompt = `
+RECENT KINGS (recent rulers):
+${dynastyMemory}
+
+TASK:
+Create a NEW king for the next reign.
+
+REQUIREMENTS:
+- The name must be structurally and phonetically distinct from previous kings.
+- The path to power must NOT mirror previous reigns.
+- Avoid repeating rebellions, church dominance, heirless death, or civil war if already used.
+- The story must feel politically grounded and organic.
+
+Return fields:
+- name
+- age (number)
+- description (short origin story)
+      `.trim()
+
     const data = await callLLMJson(
       {
         model: MODEL_ID,
         messages: [
-          { role: "system", content: "You generate a medieval king for the game. Return ONLY JSON." },
-          { role: "user", content: "Create a king: fields name, age (number), description (short story of coming to power)." }
+          {
+            role: "system",
+            content: king_system_prompt
+          },
+          {
+            role: "user",
+            content: king_prompt
+          }
         ]
       },
       KING_SCHEMA
     );
 
+    console.log(king_prompt)
+
     const content = data.choices?.[0]?.message?.content;
     const king = parseStrictJson(content);
-    if (!king) return res.status(500).json({ error: "Failed to create king: Invalid JSON" });
+
+    if (!king) {
+      return res.status(500).json({ error: "Failed to create king: Invalid JSON" });
+    }
 
     const nk = {
       name: String(king.name || "").trim(),
@@ -644,25 +725,36 @@ app.post("/kings/start", authRequired, async (req, res) => {
     };
 
     const v = validateKing(nk);
-    if (!v.ok) return res.status(500).json({ error: "King failed validation", details: v.errors });
+    if (!v.ok) {
+      return res.status(500).json({ error: "King failed validation", details: v.errors });
+    }
 
-    const result = db.prepare(`INSERT INTO kings (user_id, name, age, description) VALUES (?, ?, ?, ?)`)
-      .run(req.user.id, nk.name, nk.age, nk.description);
+    const result = db.prepare(`
+      INSERT INTO kings (user_id, name, age, description)
+      VALUES (?, ?, ?, ?)
+    `).run(req.user.id, nk.name, nk.age, nk.description);
+
     const kingId = result.lastInsertRowid;
 
-    db.prepare(`INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty) VALUES (?, 150, 150, 150, 150)`)
-      .run(kingId);
+    db.prepare(`
+      INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty)
+      VALUES (?, 150, 150, 150, 150)
+    `).run(kingId);
 
     const ws = createInitialWorldState(nk);
     ws.memory = ensureArcCadenceMemory(ws.memory || {});
     ws.memory.kingName = nk.name;
-
     ws.memory.finalePendingTurn = null;
     ws.memory.lastFinaleArcId = null;
     ws.memory.lastFinaleKey = null;
-    if (ws.memory.pendingArcResolution === undefined) ws.memory.pendingArcResolution = null;
+    if (ws.memory.pendingArcResolution === undefined)
+      ws.memory.pendingArcResolution = null;
 
-    saveWorldRow(kingId, { turn: ws.turn, memory: ws.memory, constraints: ws.constraints });
+    saveWorldRow(kingId, {
+      turn: ws.turn,
+      memory: ws.memory,
+      constraints: ws.constraints
+    });
 
     insertKnowledge({
       kingId,
@@ -677,8 +769,12 @@ app.post("/kings/start", authRequired, async (req, res) => {
       ...nk,
       metrics: { army: 150, economy: 150, diplomacy: 150, loyalty: 150 }
     });
+
   } catch (err) {
-    res.status(500).json({ error: "Failed to create king", details: String(err?.message || err).slice(0, 1200) });
+    res.status(500).json({
+      error: "Failed to create king",
+      details: String(err?.message || err).slice(0, 1200)
+    });
   }
 });
 
@@ -693,6 +789,9 @@ app.post("/kings/:kingId/get-card", authRequired, requireKingAccess, async (req,
     const kingName = kingRow?.name ? String(kingRow.name) : "";
 
     let worldRow = getWorldRow(kingId);
+
+    const isGameOver = worldRow?.memory?.gameOver || false;
+
     if (!worldRow) {
       const memory = ensureArcCadenceMemory({
         recentThemes: [],
@@ -798,47 +897,102 @@ app.post("/kings/:kingId/get-card", authRequired, requireKingAccess, async (req,
       ? `Anti-repeat (DO NOT repeat these recent situations):\n${recentBlock}\n`
       : "";
 
-    const prompt = `
-Game: The Fate of the King (medieval, grounded, dark tone).
-Hard constraints:
-- NO modern tech, NO guns, NO electricity, NO internet, NO cars.
-- Keep names and places consistent with medieval vibe.
-- Return ONLY JSON. No markdown.
+    
+    let gameOverSection = "";
+    let prompt = "";
 
-Metrics (0..300, higher is better):
-${JSON.stringify(metrics, null, 2)}
+    if (isGameOver) {
+      gameOverSection = `
+GAME OVER STATE:
+Game Over Reason: ${worldRow.memory?.gameOverReason || "Unknown"}
+`
+      prompt = `
+GAME: The Fate of the King
+${gameOverSection}
 
-Directive:
-${JSON.stringify(directive, null, 2)}
+METRICS (0..300, higher is better):
+${JSON.stringify(metrics)}
 
-Active arc pacing (if any):
-${JSON.stringify(arcPacing, null, 2)}
-
-${antiRepeatSection}
-
-Background knowledge (use at least 2, but do NOT copy verbatim):
+BACKGROUND KNOWLEDGE:
 ${anchors}
 
-Task:
-Generate ONE event card with 2 choices.
-Each choice must be meaningful trade-off.
-Effects must be integers [-20..20].
+TASK:
+- Generate final tragic epilogue narrative.
+- No new conflicts.
+- Close story emotionally and historically.
+- Choices must be ceremonial only.
 
-Mode guidance:
-- If there is an ACTIVE arc: advance the arc with new development (not repetition). Escalate or reveal new information.
-- If there is NO active arc:
-  - If arcStartEligible=false: generate a small standalone "side quest". MUST NOT propose a new long arc.
-  - If arcStartEligible=true: you MAY propose a new arc seed by including "arc" object.
-
-Special rule for LONG arcs (totalTurns >= 6):
-- Include investigation / mystery / trail of clues or treasure hunt progression.
-
-Arc seed rule:
-- If arcStartEligible is false, DO NOT include "arc" field.
-- If you include arc: expectedTurns should be between 3 and 6.
-
-Return ONLY JSON matching schema.
+OUTPUT: 
+- ONLY Valid JSON matching schema.
 `.trim();
+
+    }
+    else{
+      prompt = `
+GAME: The Fate of the King
+${gameOverSection}
+METRICS (0..300, higher is better):
+${JSON.stringify(metrics)}
+
+DIRECTIVE:
+${JSON.stringify(directive)}
+
+ACTIVE ARC PACING:
+${JSON.stringify(arcPacing)}
+
+ANTI-REPETITION RULES:
+${antiRepeatSection}
+
+BACKGROUND KNOWLEDGE:
+${anchors}
+
+
+
+TASK:
+Generate ONE event card with:
+- title
+- description
+- 2 choices
+- each choice has:
+    - text
+    - effects (integer changes -20..20)
+
+MODE RULES:
+- If ACTIVE arc exists: escalate or reveal new development.
+- If NO active arc:
+    - If arcStartEligible=false: generate standalone side quest.
+    - If arcStartEligible=true: you MAY include "arc" seed.
+
+LONG ARC RULE (totalTurns >= 6):
+- Include investigation, mystery, hidden motive, suspect, or treasure trail progression.
+`.trim();
+    }
+    const system_prompt = `
+ROLE: You are a professional dark medieval narrative designer.
+
+DESIGN RULES:
+- Grounded medieval setting. No modern tech.
+- Maintain internal world consistency.
+- Create tension and meaningful trade-offs.
+- Avoid trivial flavor events
+- Avoid repetition of previously used structures.
+- Ensure narrative forward motion.
+- Escalate active arcs.
+- Description 4 of 10
+- Temperature 1
+
+MULTI-STEP INTERNAL REASONING (do internally, do NOT reveal):
+1. Identify current world pressure (political, economic, religious, military, personal).
+2. Connect it to active arc or world state.
+3. Create escalating development.
+4. Design 2 asymmetric choices.
+
+MODE RULES:
+- Long arcs (>=6 turns): include investigation or clue progression.
+- Effects: integers [-20..20].
+- Tone: dark, medieval, politically and morally complex.
+- Output: ONLY Valid JSON matching schema.
+`.trim();  
 
     const label = `LLM generation king=${kingId} turn=${nextTurn} ${Date.now()}`;
     console.time(label);
@@ -849,7 +1003,7 @@ Return ONLY JSON matching schema.
         {
           model: MODEL_ID,
           messages: [
-            { role: "system", content: "You are an event card generator. Return ONLY JSON." },
+            { role: "system", content: system_prompt },
             { role: "user", content: prompt }
           ]
         },
@@ -894,6 +1048,15 @@ Return ONLY JSON matching schema.
       }
     } else {
       if (!arcStartEligible && card.arc) delete card.arc;
+    }
+
+    const gameOverChoice = "Finish your reign and retire.";
+
+    if (isGameOver) {
+      card.choices = [
+        { text: gameOverChoice, effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 } },
+        { text: gameOverChoice, effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 } }
+      ];
     }
 
     const vv = validateCard(card);
@@ -1013,6 +1176,55 @@ app.post("/kings/:kingId/apply-choice", authRequired, requireKingAccess, (req, r
     if (!isFinaleChoice) {
       insertDecisionFactAlways({ kingId, turn: mergedWorld.turn, theme, card, choiceIndex: ci });
       insertImpactFacts({ kingId, turn: mergedWorld.turn, theme, effects: eff });
+    }
+
+    const gameOver = checkGameOver(updated);
+
+    if (gameOver) {
+
+      const finalTurn = mergedWorld.turn;
+
+      db.prepare(`
+        UPDATE kings
+        SET reign_ended = 1
+        WHERE id = ?
+      `).run(kingId);
+
+      const activeArc = getActiveArc(kingId);
+      if (activeArc) {
+        db.prepare(`
+          UPDATE arcs
+          SET status='failed',
+              phase='end',
+              ended_turn=?,
+              outcome_text=?,
+              updated_at=CURRENT_TIMESTAMP
+          WHERE id=?
+        `).run(finalTurn, gameOver.text, activeArc.id);
+      }
+
+      mergedWorld.memory.gameOver = true;
+      mergedWorld.memory.gameOverReason = gameOver.text;
+      mergedWorld.memory.gameOverTurn = finalTurn;
+
+      saveWorldRow(kingId, {
+        turn: finalTurn,
+        memory: mergedWorld.memory,
+        constraints: worldRow.constraints
+      });
+
+      insertKnowledge({
+        kingId,
+        kind: "fact",
+        turn: finalTurn,
+        tags: ["game_over"],
+        text: `Game Over: ${gameOver.text}`
+      });
+
+      return res.json({
+        ...updated,
+        gameOver: true
+      });
     }
 
     let activeArc = getActiveArc(kingId);
@@ -1144,7 +1356,9 @@ app.post("/kings/:kingId/apply-choice", authRequired, requireKingAccess, (req, r
   }
 });
 
+
 app.patch("/admin/kings/:kingId/metrics", authRequired, adminRequired, (req, res) => {
+  console.log("Test")
   const kingId = Number(req.params.kingId);
   if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
 
@@ -1165,6 +1379,5 @@ app.patch("/admin/kings/:kingId/metrics", authRequired, adminRequired, (req, res
   res.json({ ok: true, kingId, metrics: updated });
 });
 
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));

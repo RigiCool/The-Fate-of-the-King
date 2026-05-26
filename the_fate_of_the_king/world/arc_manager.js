@@ -250,7 +250,6 @@ function advanceArcRow(arcRow, effects, metrics, currentTurn) {
 }
 
 module.exports = {
-
   normalizeArcSeed,
   defaultArcSeed,
   createActiveArcFromSeed,

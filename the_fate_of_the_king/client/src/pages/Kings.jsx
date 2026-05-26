@@ -48,6 +48,7 @@ export default function Kings() {
 
   useEffect(() => {
     loadKings();
+
   }, []);
   console.log(kings);
   const resume = (kingId) => {
@@ -85,7 +86,7 @@ export default function Kings() {
           </button>
         </div>
 
-        {error && <p style={{ color: "red" }}>Ошибка: {error}</p>}
+        {error && <p style={{ color: "red" }}>Error: {error}</p>}
         {loading && <p>Loading kings…</p>}
 
         {!loading && kings.length === 0 && (

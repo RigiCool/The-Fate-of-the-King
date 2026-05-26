@@ -213,12 +213,12 @@ button:focus-visible {
 }
 
 .king-card {
-  background-color: rgb(44, 43, 41); /* бежевый */
+  background-color: rgb(44, 43, 41);
 }
 
 .king-title {
-  background-color: rgb(26, 25, 23); /* голубой */
-  transform: scale(1.05); /* лёгкий zoom */
+  background-color: rgb(26, 25, 23);
+  transform: scale(1.05);
   border: 0px;
   margin-bottom: 20px;
   max-width: 100%;

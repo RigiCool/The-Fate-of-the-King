@@ -34,7 +34,6 @@ export default function Home() {
   const [error, setError] = useState(null);
   const [gameOver, setGameOver] = useState(false);
 
-
   useEffect(() => {
     if (!kingId) return;
 
@@ -55,7 +54,6 @@ export default function Home() {
       }
     })();
   }, [kingId, API, authHeaders]);
-
 
   const startGame = async () => {
     setLoading(true);
@@ -80,7 +78,6 @@ export default function Home() {
     }
   };
 
-
   const getCard = async () => {
     if (!king?.id) return;
 
@@ -102,7 +99,6 @@ export default function Home() {
       setLoading(false);
     }
   };
-
 
   const handleChoice = async (choice, choiceIndex) => {
     if (!king?.id || !card) return;
@@ -168,7 +164,7 @@ export default function Home() {
         </div>
       </div>
 
-      {error && <p style={{ color: "red" }}>Ошибка: {error}</p>}
+      {error && <p style={{ color: "red" }}>Error: {error}</p>}
 
       {!king && (
         <button className="btn" onClick={startGame} disabled={loading} style={{ marginTop: 12 }}>
@@ -204,7 +200,7 @@ export default function Home() {
       {card && (
         <>
           {card?.planner?.mode === "arc_resolution" && (
-            <p style={{ opacity: 0.8 }}>Развязка сюжетной арки</p>
+            <p style={{ opacity: 0.8 }}>📜 Arc resolution</p>
           )}
           <Card {...card} onChoice={gameOver ? redirect : handleChoice}/>
         </>

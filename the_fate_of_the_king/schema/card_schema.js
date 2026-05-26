@@ -1,4 +1,3 @@
-
 const { ARC_SEED_SCHEMA } = require("./arc_seed_schema.js");
 
 const CARD_SCHEMA = {
@@ -47,6 +46,7 @@ const CARD_SCHEMA = {
           }
         }
       },
+
       arc: ARC_SEED_SCHEMA
     }
   }

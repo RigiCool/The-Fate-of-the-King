@@ -14,3 +14,4 @@ const KING_SCHEMA = {
 };
 
 module.exports = { KING_SCHEMA };
+

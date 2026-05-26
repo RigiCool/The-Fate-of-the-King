@@ -1,5 +1,3 @@
-//--------------------------------------------------Version: 7.0.0--------------------------------------------------
-// src/auth/AuthContext.jsx
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 
@@ -59,4 +57,3 @@ export function AuthProvider({ children }) {
 export function useAuth() {
   return useContext(AuthCtx);
 }
-//--------------------------------------------------Version: 7.0.0--------------------------------------------------
