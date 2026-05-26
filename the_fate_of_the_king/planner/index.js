@@ -1,5 +1,3 @@
-planner/index.js
-
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
@@ -15,12 +13,10 @@ function weightedRandom(items) {
   return items[items.length - 1]?.[0] ?? "court";
 }
 
-function pickTheme(metrics, worldMemory, activeArc) {
+function pickTheme(metrics, memory, activeArc) {
   const w = [];
 
-  if (activeArc && activeArc.status === "active") {
-    w.push(["arc_progress", 7]);
-  }
+  if (activeArc?.status === "active") w.push(["arc_progress", 7]);
 
   if (metrics.army < 120) w.push(["military", 5]);
   if (metrics.economy < 120) w.push(["economy", 5]);
@@ -29,7 +25,7 @@ function pickTheme(metrics, worldMemory, activeArc) {
 
   w.push(["court", 2], ["intrigue", 2], ["external", 2], ["church", 1], ["peasantry", 1]);
 
-  const last = worldMemory?.recentThemes?.[0];
+  const last = memory?.recentThemes?.[0];
   if (last) {
     for (let i = 0; i < w.length; i++) {
       if (w[i][0] === last) w[i][1] = clamp(w[i][1] - 1, 0, 999);
@@ -65,18 +61,12 @@ function intentFromTheme(theme, metrics, activeArc) {
   }
 }
 
-function buildPlannerPacket(metrics, worldRow, activeArcRow, factsRows) {
+function buildPlannerPacket(metrics, worldRow, activeArcRow) {
   const memory = worldRow?.memory || {};
   const theme = pickTheme(metrics, memory, activeArcRow);
 
-  const mustUseFacts = (factsRows || [])
-    .slice(-6)
-    .map(f => f.text)
-    .filter(Boolean);
-
-  const arcHint = activeArcRow
+  const arcDirective = activeArcRow
     ? {
-        title: activeArcRow.title,
         kind: activeArcRow.kind,
         phase: activeArcRow.phase,
         stage: activeArcRow.stage,
@@ -88,9 +78,7 @@ function buildPlannerPacket(metrics, worldRow, activeArcRow, factsRows) {
   return {
     theme,
     intent: intentFromTheme(theme, metrics, activeArcRow),
-    difficulty: 1,
-    arcHint,
-    mustUseFacts
+    arcDirective
   };
 }
 

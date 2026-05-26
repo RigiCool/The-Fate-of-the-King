@@ -9,18 +9,22 @@ const { KING_SCHEMA } = require("./schema/king_schema.js");
 
 const { makeValidator, parseStrictJson, normalizeCard } = require("./validator/index.js");
 const { buildPlannerPacket } = require("./planner/index.js");
-const { createInitialWorldState, applyChoiceToMemory, compressWorldForPrompt } = require("./world/world_state.js");
-const { normalizeArcSeed, defaultArcSeed, createActiveArcFromSeed, advanceArcRow } = require("./world/arc_manager.js");
+const { createInitialWorldState, applyChoiceToMemory } = require("./world/world_state.js");
+const {
+  normalizeArcSeed,
+  defaultArcSeed,
+  createActiveArcFromSeed,
+  advanceArcRow
+} = require("./world/arc_manager.js");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL_ID = process.env.MODEL_ID || "google/gemma-3-27b-it:free";
+const MODEL_ID = process.env.MODEL_ID || "arcee-ai/trinity-large-preview:free";
 
 const db = new Database("./game.db");
-
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS kings (
@@ -41,7 +45,6 @@ CREATE TABLE IF NOT EXISTS metrics (
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
 
--- world state: small, no facts/arcs inside
 CREATE TABLE IF NOT EXISTS world_state (
   king_id INTEGER PRIMARY KEY,
   turn INTEGER NOT NULL DEFAULT 0,
@@ -51,19 +54,6 @@ CREATE TABLE IF NOT EXISTS world_state (
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
 
--- facts normalized
-CREATE TABLE IF NOT EXISTS facts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  king_id INTEGER NOT NULL,
-  created_turn INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  tags_json TEXT NOT NULL DEFAULT '[]',
-  confidence REAL NOT NULL DEFAULT 0.75,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (king_id) REFERENCES kings(id)
-);
-
--- arcs normalized (we keep history; at most one active)
 CREATE TABLE IF NOT EXISTS arcs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   king_id INTEGER NOT NULL,
@@ -84,9 +74,8 @@ CREATE TABLE IF NOT EXISTS arcs (
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
 
--- only one active arc per king (partial unique index)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_arcs_one_active
-ON arcs(king_id) WHERE status = 'active';
+ON arcs(king_id) WHERE status='active';
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +88,33 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (king_id) REFERENCES kings(id)
 );
+
+-- полезно для защиты от дублей при повторном /get-card
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_per_turn
+ON events(king_id, turn);
+
+-- Knowledge store: facts + events + arc outcomes
+CREATE TABLE IF NOT EXISTS knowledge (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  king_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                 -- fact | event | arc_outcome
+  ref_table TEXT,
+  ref_id INTEGER,
+  turn INTEGER NOT NULL,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  text TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (king_id) REFERENCES kings(id)
+);
+
+-- FTS5 index (contentless)
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+  text,
+  tags,
+  king_id UNINDEXED,
+  turn UNINDEXED,
+  content=''
+);
 `);
 
 function ensureEventsColumns() {
@@ -108,17 +124,26 @@ function ensureEventsColumns() {
     { name: "effects_json", sql: `ALTER TABLE events ADD COLUMN effects_json TEXT` },
     { name: "summary", sql: `ALTER TABLE events ADD COLUMN summary TEXT` }
   ];
-  for (const c of need) {
-    if (!cols.includes(c.name)) db.exec(c.sql);
-  }
+  for (const c of need) if (!cols.includes(c.name)) db.exec(c.sql);
 }
 ensureEventsColumns();
 
+
+function safeJsonParse(s, fallback) {
+  try { return JSON.parse(s); } catch { return fallback; }
+}
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function isRetryable(err) {
   const msg = String(err?.message || "");
-  return msg.includes("502") || msg.includes("503") || msg.includes("504") || msg.includes("429") || msg.includes("Provider returned error");
+  return (
+    msg.includes("502") ||
+    msg.includes("503") ||
+    msg.includes("504") ||
+    msg.includes("429") ||
+    msg.includes("Provider returned error")
+  );
 }
+
 async function callOpenRouter(body) {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -131,6 +156,7 @@ async function callOpenRouter(body) {
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
 async function callOpenRouterWithRetry(body, { retries = 2, baseDelayMs = 400 } = {}) {
   let last = null;
   for (let a = 0; a <= retries; a++) {
@@ -144,12 +170,12 @@ async function callOpenRouterWithRetry(body, { retries = 2, baseDelayMs = 400 } 
   throw last;
 }
 
-
 function modelSupportsJsonSchema(modelId) {
   const m = String(modelId || "").toLowerCase();
   if (m.includes("gemma-3-27b-it")) return false;
   return true;
 }
+
 async function callLLMJson(body, schemaObj) {
   const useSchema = schemaObj && modelSupportsJsonSchema(body.model);
   const finalBody = useSchema
@@ -159,7 +185,10 @@ async function callLLMJson(body, schemaObj) {
   if (!useSchema && schemaObj) {
     finalBody.messages = [
       ...(finalBody.messages || []),
-      { role: "user", content: `Return ONLY valid JSON. No markdown. Must match schema:\n${JSON.stringify(schemaObj.schema, null, 2)}` }
+      {
+        role: "user",
+        content: `Return ONLY valid JSON. No markdown. Must match schema:\n${JSON.stringify(schemaObj.schema, null, 2)}`
+      }
     ];
   }
 
@@ -184,10 +213,13 @@ function clampMetric(x) {
   return Math.max(0, Math.min(300, Math.round(n)));
 }
 
+function getKingRow(kingId) {
+  return db.prepare(`SELECT id, name, age, description FROM kings WHERE id=?`).get(kingId) || null;
+}
+
 function getMetrics(kingId) {
   return db.prepare(`SELECT army, economy, diplomacy, loyalty FROM metrics WHERE king_id=?`).get(kingId);
 }
-
 
 function getWorldRow(kingId) {
   const row = db.prepare(`SELECT turn, memory_json, constraints_json FROM world_state WHERE king_id=?`).get(kingId);
@@ -198,11 +230,16 @@ function getWorldRow(kingId) {
     constraints: safeJsonParse(row.constraints_json, {})
   };
 }
+
 function saveWorldRow(kingId, worldObj) {
   db.prepare(`
     INSERT INTO world_state (king_id, turn, memory_json, constraints_json, updated_at)
     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(king_id) DO UPDATE SET turn=excluded.turn, memory_json=excluded.memory_json, constraints_json=excluded.constraints_json, updated_at=CURRENT_TIMESTAMP
+    ON CONFLICT(king_id) DO UPDATE SET
+      turn=excluded.turn,
+      memory_json=excluded.memory_json,
+      constraints_json=excluded.constraints_json,
+      updated_at=CURRENT_TIMESTAMP
   `).run(
     kingId,
     worldObj.turn ?? 0,
@@ -211,23 +248,50 @@ function saveWorldRow(kingId, worldObj) {
   );
 }
 
-function safeJsonParse(s, fallback) {
-  try { return JSON.parse(s); } catch { return fallback; }
-}
-
 function getActiveArc(kingId) {
   return db.prepare(`SELECT * FROM arcs WHERE king_id=? AND status='active' LIMIT 1`).get(kingId) || null;
 }
 
-function getRecentFacts(kingId, limit = 12) {
-  return db.prepare(`SELECT * FROM facts WHERE king_id=? ORDER BY created_turn ASC, id ASC LIMIT ?`).all(kingId, limit);
+function getEventIdByTurn(kingId, turn) {
+  return db.prepare(`SELECT id FROM events WHERE king_id=? AND turn=? LIMIT 1`).get(kingId, turn)?.id ?? null;
+}
+
+function getEventCardByTurn(kingId, turn) {
+  const row = db.prepare(`SELECT card_json FROM events WHERE king_id=? AND turn=? LIMIT 1`).get(kingId, turn);
+  if (!row) return null;
+  return safeJsonParse(row.card_json, null);
+}
+
+function getRecentEventSummaries(kingId, limit = 4) {
+  const rows = db.prepare(`
+    SELECT turn, card_json, summary
+    FROM events
+    WHERE king_id=? AND chosen_index IS NOT NULL
+    ORDER BY turn DESC
+    LIMIT ?
+  `).all(kingId, limit);
+
+
+  const out = [];
+  for (const r of rows) {
+    const card = safeJsonParse(r.card_json, null);
+    const title = String(card?.title || "").trim();
+    const desc = String(card?.description || "").trim();
+    const short = desc.length > 140 ? desc.slice(0, 137) + "..." : desc;
+    const line = `- (turn ${r.turn}) ${title}${short ? ` — ${short}` : ""}`.trim();
+    if (title) out.push(line);
+  }
+  return out;
 }
 
 function insertEvent({ kingId, turn, card }) {
-  db.prepare(`
+  const existing = getEventIdByTurn(kingId, turn);
+  if (existing) return existing;
+  const info = db.prepare(`
     INSERT INTO events (king_id, turn, card_json, chosen_index, effects_json, summary, created_at)
     VALUES (?, ?, ?, NULL, NULL, '', CURRENT_TIMESTAMP)
   `).run(kingId, turn, JSON.stringify(card));
+  return info.lastInsertRowid;
 }
 
 function updateEventChoice({ kingId, turn, choiceIndex, effects, summary }) {
@@ -237,31 +301,335 @@ function updateEventChoice({ kingId, turn, choiceIndex, effects, summary }) {
   `).run(choiceIndex, JSON.stringify(effects), summary || "", kingId, turn);
 }
 
-function maybeInsertFact({ kingId, turn, text, tags = [], confidence = 0.75 }) {
+
+function normalizeTags(tags) {
+  const arr = Array.isArray(tags) ? tags : [];
+  const out = [];
+  const seen = new Set();
+  for (const t of arr) {
+    const s = String(t || "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}_-]+/gu, " ")
+      .trim()
+      .replace(/\s+/g, "_");
+    if (!s || s.length < 2) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out.slice(0, 12);
+}
+
+function upsertKnowledgeFTS({ rowid, kingId, turn, text, tags = [] }) {
+  const normTags = normalizeTags(tags);
+  db.prepare(`
+    INSERT OR REPLACE INTO knowledge_fts (rowid, text, tags, king_id, turn)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(rowid, String(text || ""), normTags.join(" "), kingId, turn);
+}
+
+function insertKnowledge({ kingId, kind, refTable = null, refId = null, turn, tags = [], text }) {
   const t = String(text || "").trim();
-  if (!t) return;
+  if (!t) return null;
+
+  const normTags = normalizeTags(tags);
+
+  const info = db.prepare(`
+    INSERT INTO knowledge (king_id, kind, ref_table, ref_id, turn, tags_json, text, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+  `).run(kingId, kind, refTable, refId, turn, JSON.stringify(normTags), t);
+
+  const rowid = info.lastInsertRowid;
+  upsertKnowledgeFTS({ rowid, kingId, turn, text: t, tags: normTags });
+  return rowid;
+}
+
+function pruneFacts(kingId, maxFacts = 80) {
+
+  const ids = db.prepare(`
+    SELECT id FROM knowledge
+    WHERE king_id=? AND kind='fact'
+    ORDER BY turn DESC, id DESC
+    LIMIT ?
+  `).all(kingId, maxFacts).map(r => r.id);
+
+  if (ids.length < maxFacts) return;
+
+
+  const keepMinId = Math.min(...ids);
+  db.prepare(`
+    DELETE FROM knowledge
+    WHERE king_id=? AND kind='fact' AND id < ?
+  `).run(kingId, keepMinId);
+
 
   db.prepare(`
-    INSERT INTO facts (king_id, created_turn, text, tags_json, confidence, created_at)
-    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-  `).run(kingId, turn, t, JSON.stringify(tags), confidence);
-
-
-  db.prepare(`
-    DELETE FROM facts
-    WHERE id IN (
-      SELECT id FROM facts WHERE king_id=? ORDER BY created_turn ASC, id ASC LIMIT
-      (SELECT MAX(COUNT(*) - 60, 0) FROM facts WHERE king_id=?)
+    DELETE FROM knowledge_fts
+    WHERE rowid IN (
+      SELECT f.rowid FROM knowledge_fts f
+      LEFT JOIN knowledge k ON k.id=f.rowid
+      WHERE k.id IS NULL
     )
-  `).run(kingId, kingId);
+  `).run();
 }
 
-function finalizeArcIfEnded(kingId, worldRow) {
+function maybeInsertFact({ kingId, turn, text, tags = [] }) {
+  const t = String(text || "").trim();
+  if (!t) return null;
 
-  return worldRow;
+  const exists = db.prepare(`
+    SELECT 1 FROM knowledge
+    WHERE king_id=? AND kind='fact' AND text=? AND turn >= ?
+    LIMIT 1
+  `).get(kingId, t, Math.max(0, turn - 6));
+  if (exists) return null;
+
+  const rowid = insertKnowledge({
+    kingId,
+    kind: "fact",
+    turn,
+    tags: ["fact", ...tags],
+    text: t
+  });
+
+  pruneFacts(kingId, 80);
+  return rowid;
 }
 
+function insertDecisionFactAlways({ kingId, turn, theme, card, choiceIndex }) {
+  const ci = Number.isInteger(choiceIndex) ? choiceIndex : null;
+  if (!(card && (ci === 0 || ci === 1))) return;
 
+  const title = String(card.title || "").trim();
+  const choiceText = String(card.choices?.[ci]?.text || "").trim();
+  if (!choiceText) return;
+
+  maybeInsertFact({
+    kingId,
+    turn,
+    tags: [theme || "event", "decision"],
+    text: `Решение короля (${title || "событие"}): ${choiceText}`
+  });
+}
+
+function insertImpactFacts({ kingId, turn, theme, effects }) {
+  const deltas = [
+    ["army", effects?.army || 0, "армия"],
+    ["economy", effects?.economy || 0, "казна"],
+    ["diplomacy", effects?.diplomacy || 0, "дипломатия"],
+    ["loyalty", effects?.loyalty || 0, "лояльность"]
+  ];
+  for (const [k, d, label] of deltas) {
+    if (Math.abs(d) >= 10) {
+      const sign = d > 0 ? "выросла" : "упала";
+      maybeInsertFact({
+        kingId,
+        turn,
+        tags: [theme || "event", k, "impact"],
+        text: `Последствие решения: ${label} заметно ${sign} (Δ${k}=${d}).`
+      });
+    }
+  }
+}
+
+function retrieveKnowledgeFTS({ kingId, query, topK = 10 }) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  try {
+    const rows = db.prepare(`
+      SELECT
+        k.id AS rowid,
+        k.text AS text,
+        f.tags AS tags,
+        k.turn AS turn,
+        bm25(knowledge_fts, 1.0, 0.3) AS score
+      FROM knowledge_fts f
+      JOIN knowledge k ON k.id = f.rowid
+      WHERE knowledge_fts MATCH ?
+        AND k.king_id = ?
+      ORDER BY score ASC
+      LIMIT ?
+    `).all(q, kingId, topK);
+
+    return rows.map(r => ({
+      rowid: r.rowid,
+      text: r.text,
+      tags: String(r.tags || "").split(" ").filter(Boolean),
+      turn: r.turn,
+      score: r.score
+    }));
+  } catch (e) {
+    try {
+      const fallback = q.split(/\s+OR\s+/).slice(0, 6).join(" ");
+      const rows2 = db.prepare(`
+        SELECT
+          k.id AS rowid,
+          k.text AS text,
+          f.tags AS tags,
+          k.turn AS turn,
+          bm25(knowledge_fts, 1.0, 0.3) AS score
+        FROM knowledge_fts f
+        JOIN knowledge k ON k.id = f.rowid
+        WHERE knowledge_fts MATCH ?
+          AND k.king_id = ?
+        ORDER BY score ASC
+        LIMIT ?
+      `).all(fallback, kingId, topK);
+
+      return rows2.map(r => ({
+        rowid: r.rowid,
+        text: r.text,
+        tags: String(r.tags || "").split(" ").filter(Boolean),
+        turn: r.turn,
+        score: r.score
+      }));
+    } catch {
+      return [];
+    }
+  }
+}
+
+function mergeRetrieved(core, situational, limit = 12) {
+  const out = [];
+  const seen = new Set();
+  for (const x of [...(core || []), ...(situational || [])]) {
+    const rid = x.rowid ?? "";
+    const key = `${rid}|${String(x.text || "").slice(0, 160)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(x);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function selectAnchors(retrieved, { isFinale = false } = {}) {
+  const list = Array.isArray(retrieved) ? retrieved.slice() : [];
+  if (list.length === 0) return [];
+
+  const byFresh = [...list].sort((a, b) => (b.turn ?? 0) - (a.turn ?? 0));
+  const byScore = [...list].sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+
+  const picks = [];
+  const seen = new Set();
+
+  const want = isFinale ? 6 : 4;
+
+  function take(arr, n) {
+    for (const r of arr) {
+      const key = `${r.rowid}|${String(r.text || "").slice(0, 80)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      picks.push(r);
+      if (picks.length >= n) break;
+    }
+  }
+
+  if (isFinale) {
+
+    take(byFresh, Math.min(3, want));
+    take(byScore, want);
+  } else {
+    take(byFresh, 2);
+    take(byScore, want);
+  }
+
+  return picks.slice(0, want);
+}
+
+function buildRetrievalQuery({ kingName, metrics, planner, worldRow, activeArc }) {
+  const parts = [];
+
+  if (planner?.intent) parts.push(planner.intent);
+  if (planner?.theme) parts.push(planner.theme);
+
+  const mem = worldRow?.memory || {};
+  if (mem.lastEventSummary) parts.push(mem.lastEventSummary);
+  if (mem.lastChoiceSummary) parts.push(mem.lastChoiceSummary);
+
+  if (kingName) parts.push(kingName);
+
+  if (activeArc?.status === "active") {
+    parts.push(activeArc.kind);
+    parts.push(activeArc.title);
+    if (activeArc.stakes) parts.push(activeArc.stakes);
+    if (activeArc.phase) parts.push(activeArc.phase);
+    if (activeArc.trigger_metric) parts.push(activeArc.trigger_metric);
+
+
+    const st = Number(activeArc.stage || 0);
+    if (st <= 1) parts.push("rumor", "pressure", "warning");
+    else if (st === 2) parts.push("ultimatum", "deadline", "uprising", "siege");
+    else parts.push("confrontation", "trial", "battle", "reckoning");
+  }
+
+  if (metrics.economy < 120) parts.push("tax", "grain", "debt", "market", "trade");
+  if (metrics.loyalty < 120) parts.push("nobles", "riot", "uprising", "oath");
+  if (metrics.army < 120) parts.push("garrison", "deserters", "fort", "border");
+  if (metrics.diplomacy < 120) parts.push("envoy", "treaty", "hostage", "alliance");
+
+  const tagHints = [];
+  if (planner?.theme) {
+    const th = String(planner.theme).toLowerCase().replace(/[^\w-]+/g, "");
+    if (th) tagHints.push(`tags:${th}`);
+  }
+  if (activeArc?.kind) {
+    const ak = String(activeArc.kind).toLowerCase().replace(/[^\w-]+/g, "");
+    if (ak) tagHints.push(`tags:${ak}`);
+  }
+  tagHints.push("tags:event", "tags:arc", "tags:fact", "tags:decision");
+
+  const uniq = [];
+  const seen = new Set();
+  for (const p of parts.join(" ").split(/\s+/).filter(Boolean)) {
+    const w = p.replace(/[^\p{L}\p{N}_-]+/gu, "").toLowerCase();
+    if (!w || w.length < 3) continue;
+    if (seen.has(w)) continue;
+    seen.add(w);
+    uniq.push(w);
+    if (uniq.length >= 16) break;
+  }
+
+  const base = uniq.join(" OR ");
+  const tagsPart = tagHints.filter(Boolean).join(" OR ");
+  return [tagsPart, base].filter(Boolean).join(" OR ");
+}
+
+app.post("/debug/rebuild-fts", (req, res) => {
+  try {
+    db.exec(`DELETE FROM knowledge_fts;`);
+
+    const rows = db.prepare(`
+      SELECT id, king_id, turn, tags_json, text
+      FROM knowledge
+      ORDER BY id ASC
+    `).all();
+
+    const stmt = db.prepare(`
+      INSERT INTO knowledge_fts (rowid, text, tags, king_id, turn)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      for (const r of rows) {
+        const tags = normalizeTags(safeJsonParse(r.tags_json, []));
+        stmt.run(r.id, r.text, tags.join(" "), r.king_id, r.turn);
+      }
+    });
+
+    tx();
+    res.json({ ok: true, rebuilt: rows.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e).slice(0, 1000) });
+  }
+});
+
+app.get("/debug/world/:kingId", (req, res) => {
+  const kingId = Number(req.params.kingId);
+  if (!Number.isFinite(kingId)) return res.status(400).json({ error: "Bad kingId" });
+  const w = getWorldRow(kingId);
+  res.json({ kingId, world: w || null });
+});
 
 app.post("/start-game", async (req, res) => {
   try {
@@ -295,7 +663,26 @@ app.post("/start-game", async (req, res) => {
     db.prepare(`INSERT INTO metrics (king_id, army, economy, diplomacy, loyalty) VALUES (?, 150, 150, 150, 150)`).run(kingId);
 
     const ws = createInitialWorldState(nk);
+    ws.memory = ws.memory || {};
+    ws.memory.kingName = nk.name;
+
+
+    ws.memory.finalePendingTurn = null;
+    ws.memory.lastFinaleArcId = null;
+    ws.memory.lastFinaleKey = null;
+
+
+    if (ws.memory.pendingArcResolution === undefined) ws.memory.pendingArcResolution = null;
+
     saveWorldRow(kingId, { turn: ws.turn, memory: ws.memory, constraints: ws.constraints });
+
+    insertKnowledge({
+      kingId,
+      kind: "fact",
+      turn: 0,
+      tags: ["king", "origin"],
+      text: `Король ${nk.name}: ${nk.description}`
+    });
 
     res.json({
       id: kingId,
@@ -304,7 +691,7 @@ app.post("/start-game", async (req, res) => {
     });
   } catch (err) {
     console.warn("Ошибка генерации короля:", err.message);
-    res.status(500).json({ error: "Не удалось создать короля" });
+    res.status(500).json({ error: "Не удалось создать короля", details: String(err.message).slice(0, 1200) });
   }
 });
 
@@ -316,43 +703,150 @@ app.post("/get-card", async (req, res) => {
     const metrics = getMetrics(kingId);
     if (!metrics) return res.status(404).json({ error: "Метрики не найдены" });
 
+    const kingRow = getKingRow(kingId);
+    const kingName = kingRow?.name ? String(kingRow.name) : "";
+
     let worldRow = getWorldRow(kingId);
     if (!worldRow) {
-
-      saveWorldRow(kingId, { turn: 0, memory: { recentThemes: [] }, constraints: { tone: "dark medieval", noModern: true } });
+      saveWorldRow(kingId, {
+        turn: 0,
+        memory: {
+          recentThemes: [],
+          lastEventSummary: "",
+          lastChoiceSummary: "",
+          lastArc: null,
+          pendingArcResolution: null,
+          finalePendingTurn: null,
+          lastFinaleArcId: null,
+          lastFinaleKey: null,
+          kingName
+        },
+        constraints: { tone: "dark medieval", noModern: true }
+      });
       worldRow = getWorldRow(kingId);
+    } else {
+      worldRow.memory = worldRow.memory || {};
+      if (!worldRow.memory.kingName && kingName) worldRow.memory.kingName = kingName;
+      if (worldRow.memory.finalePendingTurn === undefined) worldRow.memory.finalePendingTurn = null;
+      if (worldRow.memory.lastFinaleArcId === undefined) worldRow.memory.lastFinaleArcId = null;
+      if (worldRow.memory.lastFinaleKey === undefined) worldRow.memory.lastFinaleKey = null;
+      if (worldRow.memory.pendingArcResolution && worldRow.memory.pendingArcResolution.arcId === undefined) {
+        worldRow.memory.pendingArcResolution.arcId = null;
+      }
+    }
+
+    const nextTurn = (worldRow.turn ?? 0) + 1;
+
+    const existingCard = getEventCardByTurn(kingId, nextTurn);
+    if (existingCard) {
+      return res.json({
+        ...existingCard,
+        turn: nextTurn,
+        planner: { reused: true }
+      });
     }
 
     const activeArc = getActiveArc(kingId);
-    const facts = getRecentFacts(kingId, 16);
+    const planner = buildPlannerPacket(metrics, worldRow, activeArc);
 
-    const planner = buildPlannerPacket(metrics, worldRow, activeArc, facts);
-    const worldForPrompt = compressWorldForPrompt(worldRow, activeArc, facts);
+    const pending = worldRow.memory?.pendingArcResolution || null;
+    const pendingArcId = pending?.arcId ?? null;
+    const lastFinaleArcId = worldRow.memory?.lastFinaleArcId ?? null;
+
+    const pendingKey =
+      pending && (pendingArcId == null)
+        ? `${String(pending.title || "")}|${String(pending.kind || "")}|${String(pending.outcome || "")}`.slice(0, 220)
+        : null;
+
+    const isFinale =
+      (!!pending && pendingArcId != null && pendingArcId !== lastFinaleArcId) ||
+      (!!pendingKey && worldRow.memory.lastFinaleKey !== pendingKey);
+
+
+    const recentSummaries = getRecentEventSummaries(kingId, 4);
+    const recentBlock = recentSummaries.length ? recentSummaries.join("\n") : "- (none)";
+
+
+    let retrieved = [];
+    if (isFinale) {
+      const coreQuery = `tags:king OR tags:origin`;
+      const titlePart = String(pending?.title || "").replace(/[^\p{L}\p{N}_-]+/gu, " ").trim();
+      const situationalQuery = [
+        "tags:arc",
+        "tags:outcome",
+        "tags:start",
+        "tags:event",
+        titlePart ? titlePart : ""
+      ].filter(Boolean).join(" OR ");
+
+      const core = retrieveKnowledgeFTS({ kingId, query: coreQuery, topK: 3 });
+      const situational = retrieveKnowledgeFTS({ kingId, query: situationalQuery, topK: 16 });
+      retrieved = mergeRetrieved(core, situational, 16);
+    } else {
+      const coreQuery = `tags:king OR tags:origin OR tags:arc OR tags:fact OR tags:decision`;
+      const situationalQuery = buildRetrievalQuery({ kingName, metrics, planner, worldRow, activeArc });
+
+      const core = retrieveKnowledgeFTS({ kingId, query: coreQuery, topK: 6 });
+      const situational = retrieveKnowledgeFTS({ kingId, query: situationalQuery, topK: 14 });
+      retrieved = mergeRetrieved(core, situational, 16);
+    }
+
+    const anchorItems = selectAnchors(retrieved, { isFinale });
+    const anchors =
+      anchorItems
+        .map(r => `- (turn ${r.turn}) ${String(r.text || "").trim()}`)
+        .join("\n") || "- (none)";
+
+
+    const directive = isFinale
+      ? {
+          mode: "arc_resolution",
+          arc: pending,
+          note:
+            "EPILOGUE: Must explicitly close the arc. No new conflict. No new arc seed. Choices ceremonial (zero effects)."
+        }
+      : {
+          mode: "normal",
+          theme: planner.theme,
+          intent: planner.intent,
+          arcDirective: planner.arcDirective
+        };
+
+    const finaleChoiceA = "Принять итог и продолжить правление";
+    const finaleChoiceB = "Закрепить исход и продолжить правление";
 
     const prompt = `
 Game: The Fate of the King (medieval, grounded, dark tone).
 Hard constraints:
 - NO modern tech, NO guns, NO electricity, NO internet, NO cars.
+- Keep names and places consistent with medieval vibe.
 - Avoid repeating the exact same scenario.
+- The event MUST fit the current situation and planner intent.
 
-Current metrics (0..300):
+Current metrics (0..300, higher is better):
 ${JSON.stringify(metrics, null, 2)}
 
-Planner packet:
-${JSON.stringify(planner, null, 2)}
+Directive:
+${JSON.stringify(directive, null, 2)}
 
-World (compressed):
-${JSON.stringify(worldForPrompt, null, 2)}
+Rules:
+- Create a materially different scenario than the anti-repeat list.
+- Use at least 2 anchor facts (names/places/consequences), but do NOT copy anchors verbatim.
+
+Background knowledge:
+${anchors}
 
 Task:
-Generate ONE event card with 2 choices, each meaningful with trade-offs.
+Generate ONE event card with 2 choices.
+Each choice should feel meaningful and trade-off-ish.
 Effects must be integers in range [-20..20].
-
-Arc seed rule:
-- If there is NO active arc (world.arc is null), you MAY include an "arc" object in the card to propose a new arc seed.
-- If there IS an active arc, you may omit "arc" or keep it minimal.
-
 Return ONLY JSON matching the schema.
+
+Arc seed rule (only for normal mode):
+- If there is NO active arc AND mode is normal, you MAY include "arc" object as a seed.
+- Never include status/phase/stage/tension inside card.arc.
+
+Return ONLY JSON matching schema.
 `.trim();
 
     const label = `LLM generation ${kingId} ${Date.now()}`;
@@ -373,37 +867,83 @@ Return ONLY JSON matching the schema.
     } finally {
       console.timeEnd(label);
     }
-
+    console.log(prompt);
     const content = data.choices?.[0]?.message?.content;
     if (!content) return res.status(500).json({ error: "Пустой ответ LLM" });
 
     let card = normalizeCard(parseStrictJson(content));
-    const v = validateCard(card);
-    if (!v.ok) return res.status(500).json({ error: "Карточка не прошла валидацию", details: v.errors });
 
-    const imgLabel = `Image generation ${kingId} ${Date.now()}`;
-    console.time(imgLabel);
+
+    if (isFinale) {
+      const t = String(card.title || "").trim();
+      if (!/^Эпилог:|^Развязка:/i.test(t)) {
+        card.title = `Эпилог: ${t || (pending?.title ? pending.title : "Итог арки")}`.slice(0, 120);
+      }
+
+      card.choices = [
+        { text: finaleChoiceA, effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 } },
+        { text: finaleChoiceB, effects: { army: 0, economy: 0, loyalty: 0, diplomacy: 0 } }
+      ];
+
+      if (card.arc) delete card.arc;
+
+      const d = String(card.description || "").trim();
+      const has1 = d.includes("Арка завершилась:");
+      const has2 = d.includes("Цена:");
+      const has3 = d.includes("Теперь:");
+      if (!(has1 && has2 && has3)) {
+        const outcome = String(pending?.outcome || "").trim();
+        const patch = [
+          has1 ? null : `Арка завершилась: ${outcome || "кризис получил ясный исход."}`,
+          has2 ? null : `Цена: решение оставило след в людях и казне.`,
+          has3 ? null : `Теперь: король продолжает правление в новом порядке вещей.`
+        ].filter(Boolean).join("\n");
+        card.description = `${d}\n\n${patch}`.trim().slice(0, 800);
+      }
+    }
+
+    const vv = validateCard(card);
+    if (!vv.ok) return res.status(500).json({ error: "Карточка не прошла валидацию", details: vv.errors });
+
+
     try {
       card.image = await generateImage(`${card.title}. Medieval illustration, dark, dramatic, cinematic.`);
-    } finally {
-      console.timeEnd(imgLabel);
+    } catch (e) {
+      console.warn("Image generation failed:", String(e.message).slice(0, 160));
+      card.image = null;
     }
 
-
-    const nextTurn = (worldRow.turn ?? 0) + 1;
     insertEvent({ kingId, turn: nextTurn, card });
 
-    res.json({ ...card, turn: nextTurn, planner });
-    } catch (err) {
-      console.error("Ошибка генерации карточки:", err?.message);
-      console.error(err?.stack);
+    if (isFinale) {
+      const w2 = getWorldRow(kingId);
+      w2.memory = w2.memory || {};
+      w2.memory.pendingArcResolution = null;
+      w2.memory.finalePendingTurn = nextTurn;
 
-      res.status(500).json({
-        error: "Не удалось сгенерировать карточку",
-        details: String(err?.message || err).slice(0, 1500)
-      });
+      if (pendingArcId != null) w2.memory.lastFinaleArcId = pendingArcId;
+      if (pendingKey) w2.memory.lastFinaleKey = pendingKey;
+
+      saveWorldRow(kingId, { turn: w2.turn, memory: w2.memory, constraints: w2.constraints });
     }
 
+    res.json({
+      ...card,
+      turn: nextTurn,
+      planner: { theme: planner.theme, intent: planner.intent, mode: directive.mode },
+      debug: {
+        isFinale,
+        anchorsCount: anchorItems.length,
+        recentCount: recentSummaries.length
+      }
+    });
+  } catch (err) {
+    console.warn("Ошибка генерации карточки:", err?.message);
+    res.status(500).json({
+      error: "Не удалось сгенерировать карточку",
+      details: String(err?.message || err).slice(0, 1400)
+    });
+  }
 });
 
 app.post("/apply-choice", (req, res) => {
@@ -414,48 +954,80 @@ app.post("/apply-choice", (req, res) => {
     const metrics = getMetrics(kingId);
     if (!metrics) return res.status(404).json({ error: "Метрики не найдены" });
 
-    const updated = {
-      army: clampMetric(metrics.army + (effects.army || 0)),
-      economy: clampMetric(metrics.economy + (effects.economy || 0)),
-      diplomacy: clampMetric(metrics.diplomacy + (effects.diplomacy || 0)),
-      loyalty: clampMetric(metrics.loyalty + (effects.loyalty || 0))
-    };
-
-    db.prepare(`UPDATE metrics SET army=?, economy=?, diplomacy=?, loyalty=? WHERE king_id=?`).run(
-      updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId
-    );
-
     let worldRow = getWorldRow(kingId);
     if (!worldRow) return res.status(500).json({ error: "world_state не найден" });
 
     const ci = Number.isInteger(choiceIndex) ? choiceIndex : null;
     if (!(card && (ci === 0 || ci === 1))) return res.status(400).json({ error: "Нужны card и choiceIndex 0/1" });
 
+    const supposedTurn = (worldRow.turn ?? 0) + 1;
+    const isFinaleChoice =
+      Number.isInteger(worldRow.memory?.finalePendingTurn) &&
+      worldRow.memory.finalePendingTurn === supposedTurn;
+
+    const eff = isFinaleChoice
+      ? { army: 0, economy: 0, diplomacy: 0, loyalty: 0 }
+      : {
+          army: Number(effects.army) || 0,
+          economy: Number(effects.economy) || 0,
+          diplomacy: Number(effects.diplomacy) || 0,
+          loyalty: Number(effects.loyalty) || 0
+        };
+
+    const updated = {
+      army: clampMetric(metrics.army + (eff.army || 0)),
+      economy: clampMetric(metrics.economy + (eff.economy || 0)),
+      diplomacy: clampMetric(metrics.diplomacy + (eff.diplomacy || 0)),
+      loyalty: clampMetric(metrics.loyalty + (eff.loyalty || 0))
+    };
+
+    db.prepare(`UPDATE metrics SET army=?, economy=?, diplomacy=?, loyalty=? WHERE king_id=?`).run(
+      updated.army, updated.economy, updated.diplomacy, updated.loyalty, kingId
+    );
+
 
     const mergedWorld = applyChoiceToMemory(worldRow, card, ci, theme);
+
+    if (isFinaleChoice) {
+      mergedWorld.memory = mergedWorld.memory || {};
+      mergedWorld.memory.finalePendingTurn = null;
+      mergedWorld.memory.pendingArcResolution = null;
+    }
+
     saveWorldRow(kingId, { turn: mergedWorld.turn, memory: mergedWorld.memory, constraints: worldRow.constraints });
 
 
-    const impact =
-      Math.abs(effects.army || 0) +
-      Math.abs(effects.economy || 0) +
-      Math.abs(effects.diplomacy || 0) +
-      Math.abs(effects.loyalty || 0);
+    updateEventChoice({
+      kingId,
+      turn: mergedWorld.turn,
+      choiceIndex: ci,
+      effects: eff,
+      summary: `Choice: ${String(card.choices?.[ci]?.text || "").slice(0, 240)}`
+    });
 
-    if (impact >= 25) {
-      maybeInsertFact({
-        kingId,
-        turn: mergedWorld.turn,
-        text: `Решение: "${card.choices?.[ci]?.text || ""}"`,
-        tags: [theme || "event"],
-        confidence: 0.75
-      });
+    const eventId = getEventIdByTurn(kingId, mergedWorld.turn);
+
+
+    insertKnowledge({
+      kingId,
+      kind: "event",
+      refTable: "events",
+      refId: eventId,
+      turn: mergedWorld.turn,
+      tags: [theme || "event", "event"],
+      text:
+        `Ход ${mergedWorld.turn}. ${String(card.title || "").trim()} — ${String(card.description || "").trim().slice(0, 220)}. ` +
+        `Выбор: "${String(card.choices?.[ci]?.text || "").trim().slice(0, 200)}".`
+    });
+
+    if (!isFinaleChoice) {
+      insertDecisionFactAlways({ kingId, turn: mergedWorld.turn, theme, card, choiceIndex: ci });
+      insertImpactFacts({ kingId, turn: mergedWorld.turn, theme, effects: eff });
     }
-
 
     let activeArc = getActiveArc(kingId);
     if (activeArc) {
-      const advanced = advanceArcRow(activeArc, effects, updated, mergedWorld.turn);
+      const advanced = advanceArcRow(activeArc, eff, updated, mergedWorld.turn);
 
       db.prepare(`
         UPDATE arcs
@@ -471,38 +1043,55 @@ app.post("/apply-choice", (req, res) => {
         activeArc.id
       );
 
-  
       if (advanced.status !== "active") {
-        const newWorld = getWorldRow(kingId);
-        newWorld.memory = newWorld.memory || {};
-        newWorld.memory.lastArc = {
+        const w2 = getWorldRow(kingId);
+        w2.memory = w2.memory || {};
+
+        w2.memory.lastArc = {
           title: advanced.title,
           kind: advanced.kind,
           status: advanced.status,
           endedTurn: advanced.ended_turn,
           outcome: advanced.outcome_text
         };
-        saveWorldRow(kingId, { turn: newWorld.turn, memory: newWorld.memory, constraints: newWorld.constraints });
+
+        w2.memory.pendingArcResolution = {
+          arcId: activeArc.id,
+          title: advanced.title,
+          kind: advanced.kind,
+          outcome: advanced.outcome_text
+        };
+
+        saveWorldRow(kingId, { turn: w2.turn, memory: w2.memory, constraints: w2.constraints });
+
+        insertKnowledge({
+          kingId,
+          kind: "arc_outcome",
+          refTable: "arcs",
+          refId: activeArc.id,
+          turn: mergedWorld.turn,
+          tags: ["arc", advanced.kind, "outcome", advanced.status],
+          text: `Развязка арки "${advanced.title}": ${advanced.outcome_text}`
+        });
       }
     }
 
-
     activeArc = getActiveArc(kingId);
-    if (!activeArc) {
+    if (!activeArc && !isFinaleChoice) {
+      const wNow = getWorldRow(kingId);
+      const lastArc = wNow?.memory?.lastArc || null;
+      const cooldownOk = !lastArc?.endedTurn || (mergedWorld.turn - lastArc.endedTurn) >= 2;
+
       const seed = normalizeArcSeed(card.arc) || defaultArcSeed(updated);
       const newArc = createActiveArcFromSeed(seed, mergedWorld.turn);
 
-   
-      const currentWorld = getWorldRow(kingId);
-      const lastArc = currentWorld?.memory?.lastArc;
-      const sameKey = lastArc &&
-        String(lastArc.title).toLowerCase().trim() === String(newArc.title).toLowerCase().trim() &&
-        String(lastArc.kind).toLowerCase().trim() === String(newArc.kind).toLowerCase().trim();
+      const sameKey =
+        lastArc &&
+        String(lastArc.title || "").trim().toLowerCase() === String(newArc.title || "").trim().toLowerCase() &&
+        String(lastArc.kind || "").trim().toLowerCase() === String(newArc.kind || "").trim().toLowerCase();
 
-      const cooldownOk = !lastArc || !Number.isInteger(lastArc.endedTurn) || (mergedWorld.turn - lastArc.endedTurn) >= 2;
-
-      if (!sameKey && cooldownOk) {
-        db.prepare(`
+      if (cooldownOk && !sameKey) {
+        const info = db.prepare(`
           INSERT INTO arcs (
             king_id, title, kind, trigger_metric, stakes,
             status, phase, stage, tension,
@@ -521,23 +1110,25 @@ app.post("/apply-choice", (req, res) => {
           newArc.created_turn,
           newArc.expires_turn
         );
+
+        insertKnowledge({
+          kingId,
+          kind: "fact",
+          refTable: "arcs",
+          refId: info.lastInsertRowid,
+          turn: mergedWorld.turn,
+          tags: ["arc", newArc.kind, "start"],
+          text: `Началась арка "${newArc.title}" (${newArc.kind}). Ставки: ${newArc.stakes}`
+        });
       }
     }
 
-    updateEventChoice({
-      kingId,
-      turn: mergedWorld.turn,
-      choiceIndex: ci,
-      effects,
-      summary: `Choice: ${String(card.choices?.[ci]?.text || "").slice(0, 200)}`
-    });
-
-    res.json({ ...updated });
+    res.json(updated);
   } catch (err) {
-    console.error("Ошибка apply-choice:", err.message);
+    console.error("Ошибка apply-choice:", err?.message);
     res.status(500).json({
       error: "Не удалось применить выбор",
-      details: String(err?.message || err).slice(0, 1500)
+      details: String(err?.message || err).slice(0, 1400)
     });
   }
 });

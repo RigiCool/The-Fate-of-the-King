@@ -4,7 +4,7 @@ function nowISO() {
 
 function createInitialWorldState(king) {
   return {
-    version: 3,
+    version: 4,
     updatedAt: nowISO(),
     turn: 0,
     king: { name: king.name, age: king.age },
@@ -12,7 +12,8 @@ function createInitialWorldState(king) {
       lastEventSummary: "",
       lastChoiceSummary: "",
       recentThemes: [],
-      lastArc: null // { title, kind, status, endedTurn }
+      lastArc: null,
+      pendingArcResolution: null
     },
     constraints: {
       tone: "dark medieval",
@@ -37,7 +38,7 @@ function applyChoiceToMemory(worldState, card, choiceIndex, theme) {
 
   w.memory = w.memory || {};
   w.memory.lastEventSummary = summarizeCard(card);
-  w.memory.lastChoiceSummary = String(choiceText).trim().slice(0, 200);
+  w.memory.lastChoiceSummary = String(choiceText).trim().slice(0, 220);
 
   const prev = Array.isArray(w.memory.recentThemes) ? w.memory.recentThemes : [];
   w.memory.recentThemes = [theme, ...prev].filter(Boolean).slice(0, 6);
@@ -45,51 +46,7 @@ function applyChoiceToMemory(worldState, card, choiceIndex, theme) {
   return w;
 }
 
-function compressWorldForPrompt(worldRow, activeArcRow, factsRows) {
-  const memory = worldRow?.memory || {};
-  const facts = Array.isArray(factsRows) ? factsRows : [];
-
-  const compactFacts = facts.slice(-8).map(f => ({
-    text: f.text,
-    tags: safeJsonParse(f.tags_json, []),
-    createdTurn: f.created_turn
-  }));
-
-  const arc = activeArcRow
-    ? {
-        title: activeArcRow.title,
-        kind: activeArcRow.kind,
-        phase: activeArcRow.phase,
-        tension: activeArcRow.tension,
-        stage: activeArcRow.stage,
-        expiresTurn: activeArcRow.expires_turn
-      }
-    : null;
-
-  return {
-    turn: worldRow?.turn ?? 0,
-    memory: {
-      lastEventSummary: memory.lastEventSummary || "",
-      lastChoiceSummary: memory.lastChoiceSummary || "",
-      recentThemes: memory.recentThemes || [],
-      lastArc: memory.lastArc || null
-    },
-    facts: compactFacts,
-    arc,
-    constraints: worldRow?.constraints || {}
-  };
-}
-
-function safeJsonParse(s, fallback) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return fallback;
-  }
-}
-
 module.exports = {
   createInitialWorldState,
-  applyChoiceToMemory,
-  compressWorldForPrompt
+  applyChoiceToMemory
 };

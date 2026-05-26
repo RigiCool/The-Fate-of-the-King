@@ -1,27 +1,15 @@
-// src/pages/Home.jsx
 import React, { useState } from "react";
 import Card from "../components/Card";
 import MetricBar from "../components/MetricBar";
 
-function stringifyErrorPayload(payload) {
-  if (!payload) return "Unknown error";
-  if (typeof payload === "string") return payload;
-  if (payload.details) return typeof payload.details === "string" ? payload.details : JSON.stringify(payload.details);
-  if (payload.error) return typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error);
+async function readErrorMessage(res) {
+  const text = await res.text().catch(() => "");
+  if (!text) return `HTTP ${res.status}`;
   try {
-    return JSON.stringify(payload);
+    const obj = JSON.parse(text);
+    return obj.details || obj.error?.message || obj.error || obj.message || JSON.stringify(obj);
   } catch {
-    return String(payload);
-  }
-}
-
-async function readJsonSafe(res) {
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("application/json")) return null;
-  try {
-    return await res.json();
-  } catch {
-    return null;
+    return text.slice(0, 600);
   }
 }
 
@@ -42,13 +30,10 @@ function Home() {
         headers: { "Content-Type": "application/json" }
       });
 
-      const payload = await readJsonSafe(res);
+      if (!res.ok) throw new Error(await readErrorMessage(res));
+      const data = await res.json();
 
-      if (!res.ok) {
-        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
-      }
-
-      setKing(payload);
+      setKing(data);
     } catch (err) {
       setError(err?.message || String(err));
     } finally {
@@ -69,13 +54,10 @@ function Home() {
         body: JSON.stringify({ kingId: king.id })
       });
 
-      const payload = await readJsonSafe(res);
+      if (!res.ok) throw new Error(await readErrorMessage(res));
+      const data = await res.json();
 
-      if (!res.ok) {
-        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
-      }
-
-      setCard(payload);
+      setCard(data);
     } catch (err) {
       setError(err?.message || String(err));
     } finally {
@@ -106,13 +88,11 @@ function Home() {
         })
       });
 
-      const payload = await readJsonSafe(res);
+      if (!res.ok) throw new Error(await readErrorMessage(res));
+      const updatedMetrics = await res.json();
 
-      if (!res.ok) {
-        throw new Error(stringifyErrorPayload(payload) || `HTTP ${res.status}`);
-      }
+      setKing((prev) => ({ ...prev, metrics: updatedMetrics }));
 
-      setKing((prev) => ({ ...prev, metrics: payload }));
       await getCard();
     } catch (err) {
       setError(err?.message || String(err));
@@ -158,7 +138,14 @@ function Home() {
         </div>
       )}
 
-      {card && <Card {...card} onChoice={handleChoice} />}
+      {card && (
+        <>
+          {card?.planner?.mode === "arc_resolution" && (
+            <p style={{ opacity: 0.8 }}>📜 Развязка сюжетной арки</p>
+          )}
+          <Card {...card} onChoice={handleChoice} />
+        </>
+      )}
     </div>
   );
 }
